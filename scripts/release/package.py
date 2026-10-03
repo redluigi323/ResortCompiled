@@ -119,6 +119,10 @@ def main():
                "--distpath", str(args.output.resolve()),
                "--workpath", str(ROOT / "work/launcher-build"),
                "--specpath", str(ROOT / "work/launcher-spec"),
+               # PyOpenGL chooses a backend at runtime. The default hook only
+               # collects the build machine's backend, omitting EGL when an
+               # X11-built launcher is run on a Wayland desktop.
+               "--collect-submodules", "OpenGL.platform",
                "--add-data", f"{payload}{';' if sys.platform == 'win32' else ':'}payload",
                "--add-data", f"{LAUNCHER / 'assets'}{';' if sys.platform == 'win32' else ':'}assets",
                str(LAUNCHER / "app.py")]
