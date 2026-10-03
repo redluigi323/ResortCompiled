@@ -43,7 +43,7 @@ needs their own supported **PAL Wii Sports Resort RZTP01** disc dump, with this
 ## Connect the two PCs with ZeroTier
 
 ZeroTier supplies a virtual LAN; Riisorted still exchanges its own encrypted
-two-player input stream. No Epic Online Services account is used.
+two-player input stream. 
 
 Follow ZeroTier's official [installation and quickstart guide](https://docs.zerotier.com/quickstart/).
 Install ZeroTier One on both PCs. One player creates a **private** network in
