@@ -135,14 +135,14 @@ def main():
     for name in ("assets", "licenses"):
         shutil.copytree(LAUNCHER / name, launcher_source / name, dirs_exist_ok=True)
     build_source = source_dir / "scripts/release"; build_source.mkdir(parents=True, exist_ok=True)
-    for name in ("package.py", "import_mii_icons.py"):
+    for name in ("package.py", "import_mii_icons.py", "build.sh"):
         shutil.copy2(ROOT / "scripts/release" / name, build_source / name)
     docs = release_dir / 'docs'; docs.mkdir(exist_ok=True)
     for name in ('Player-setup.md', 'Release-build.md', 'Riisorted-online-development.md'):
         shutil.copy2(ROOT / 'docs' / name, docs / name)
     # The complete native source snapshot is supplied beside the binary. Disc
     # images, translations, NAND data and developer directories are excluded.
-    for name in ('runtime', 'patches', 'projects'):
+    for name in ('runtime', 'patches', 'projects', 'docs'):
         shutil.copytree(ROOT / name, source_dir / name, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for source in (ROOT / 'scripts').glob('*'):
