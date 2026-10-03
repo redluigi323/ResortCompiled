@@ -1,0 +1,57 @@
+diff -ru a/src/dynamic_aspect.cpp b/src/dynamic_aspect.cpp
+--- a/src/dynamic_aspect.cpp	2026-09-29 20:21:39.264515940 -0400
++++ b/src/dynamic_aspect.cpp	2026-09-29 20:21:39.299335519 -0400
+@@ -129,6 +129,9 @@
+ }
+ 
+ void ApplyEggScreenRecords(uint32_t surfaceWidth, uint32_t surfaceHeight) {
++    // Resortcompiled: MKW EGG::Screen canvas records live at MKW-only addresses; skip until ported to WSR.
++    (void)surfaceWidth; (void)surfaceHeight;
++    return;
+     using namespace MkwDynamicAspect;
+     const uint32_t width43 =
+         g_widescreenConfigured ? EggRecordWidth(kEggRecordWidth43, surfaceWidth, surfaceHeight)
+@@ -163,6 +166,7 @@
+ 
+ 
+ void AssertMkwOffscreenScreenBypass() {
++    return;  // Resortcompiled: walks MKW gfx node lists at MKW heap addresses
+     static int lastSweptFrame = -1;
+     if (lastSweptFrame == g_gxFrameCount) {
+         return;
+diff -ru a/src/hle/task_thread.cpp b/src/hle/task_thread.cpp
+--- a/src/hle/task_thread.cpp	2026-09-29 20:21:39.261606808 -0400
++++ b/src/hle/task_thread.cpp	2026-09-29 20:21:39.299540624 -0400
+@@ -206,4 +206,6 @@
+         ClearTaskJob(taskThread, job);
+     }
+ }
+-PPC_NATIVE_OVERRIDE_VOID(801C2BE4, TaskThread_run_HLE_801c2be4, (CpuContext* ctx), (ctx));
++// Resortcompiled: MKW movie-manager/THP specific (hard-coded MKW heap/REL addresses); WSR runs the
++// translated EGG::TaskThread::Run instead.
++// PPC_NATIVE_OVERRIDE_VOID(801C2BE4, TaskThread_run_HLE_801c2be4, (CpuContext* ctx), (ctx));
+diff -ru a/src/music_attenuation.cpp b/src/music_attenuation.cpp
+--- a/src/music_attenuation.cpp	2026-09-29 20:21:39.265021145 -0400
++++ b/src/music_attenuation.cpp	2026-09-29 20:21:39.298669677 -0400
+@@ -500,6 +500,9 @@
+ }
+ 
+ void TickGuest() noexcept {
++    // Resortcompiled: MKW-only (reads MKW's sound manager pointer from a hard-coded heap address).
++    // Needs a WSR port before it can be re-enabled.
++    return;
+     const bool attenuated = ShouldAttenuate();
+     const uint32_t soundPlayerArray = ResolveSoundPlayerArray();
+     if (soundPlayerArray == 0) {
+diff -ru a/src/system_bridge.cpp b/src/system_bridge.cpp
+--- a/src/system_bridge.cpp	2026-09-29 20:21:39.265095549 -0400
++++ b/src/system_bridge.cpp	2026-09-29 20:21:39.298308920 -0400
+@@ -484,7 +484,7 @@
+     };
+ 
+     std::vector<SeedEntry> entries;
+-    constexpr uint32_t kMem1ArenaLoDefault = 0x80399180u;
++    constexpr uint32_t kMem1ArenaLoDefault = 0x807E9080u;  // WSR __ArenaLo (OSInit: lis 0x807F / addi -0x6F80); MKW was 0x80399180
+     uint32_t mem1ArenaHiDefault = 0x817f0520u;
+     constexpr uint32_t kBusClockHz =
+         static_cast<uint32_t>(TimeBaseContract::kBusClockHz);

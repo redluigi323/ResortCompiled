@@ -1,0 +1,37 @@
+diff -ruN a/src/hle/os/os_interrupt.cpp b/src/hle/os/os_interrupt.cpp
+--- a/src/hle/os/os_interrupt.cpp	2026-09-30 19:35:57.235141534 -0400
++++ b/src/hle/os/os_interrupt.cpp	2026-09-30 19:35:57.247196221 -0400
+@@ -400,8 +400,13 @@
+     const uint32_t kCallbackPtrAddr = r13 - 0x4010u;
+     const uint32_t kHandlerActiveAddr = r13 - 0x4018u;
+ 
+-    RT_LOG(RT_TAG_OS) << "OSSetPowerCallback_8004fc80 called: newCB=0x"
+-              << std::hex << newCallback << std::dec << std::endl;
++    // Resortcompiled: WSR re-registers the same callback every frame; only log changes.
++    static uint32_t s_lastLoggedPowerCallback = 0xFFFFFFFFu;
++    if (newCallback != s_lastLoggedPowerCallback) {
++        s_lastLoggedPowerCallback = newCallback;
++        RT_LOG(RT_TAG_OS) << "OSSetPowerCallback_8004fc80 called: newCB=0x"
++                  << std::hex << newCallback << std::dec << std::endl;
++    }
+ 
+     // 1. Disable Interrupts (Preserve atomicity as per SDK)
+     int32_t oldLevel = OS__DisableInterrupts_8004af10();
+diff -ruN a/src/settings_overlay.cpp b/src/settings_overlay.cpp
+--- a/src/settings_overlay.cpp	2026-09-30 19:35:36.480825676 -0400
++++ b/src/settings_overlay.cpp	2026-09-30 19:35:36.494343201 -0400
+@@ -1404,8 +1404,12 @@
+     g_displayMode = static_cast<int>(aurora_get_display_mode());
+     aurora_set_disable_copy_filter(g_disableCopyFilter);
+     aurora_set_skip_unready_pipelines(g_skipUnreadyPipelines);
+-    g_strapInputAccepted.store(false, std::memory_order_relaxed);
+-    g_startupDismissFrame.store(UINT64_MAX, std::memory_order_relaxed);
++    // Resortcompiled: the startup cover is lifted by MKW's Strap scene HLE (A pressed on the health & safety
++    // screen). WSR's strap screen is its own code with no such hook, so the cover never went away while the game
++    // ran underneath it. Treat the strap as accepted from the start; the cover now only waits for the boot
++    // shaders, and WSR's own warning screen shows (and takes the A press) normally.
++    g_strapInputAccepted.store(true, std::memory_order_relaxed);
++    g_startupDismissFrame.store(0, std::memory_order_relaxed);
+     g_bootShadersReady.store(false, std::memory_order_relaxed);
+     g_bootShaderNotice = false;
+     g_bootShaderWaitStart = {};

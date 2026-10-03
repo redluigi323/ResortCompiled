@@ -1,0 +1,106 @@
+diff -ruN a/src/resort_hang_watchdog.cpp b/src/resort_hang_watchdog.cpp
+--- a/src/resort_hang_watchdog.cpp	1969-12-31 19:30:00.000000000 -0430
++++ b/src/resort_hang_watchdog.cpp	2026-09-29 20:56:55.997026129 -0400
+@@ -0,0 +1,102 @@
++// Resortcompiled: hang diagnostics.
++//
++// Set RESORT_HANG_DUMP=<seconds> (e.g. 10) to print, every <seconds>, what each guest OS thread is doing:
++// state, priority, what it is waiting on, and its saved CPU context + stack backchain (with symbols).
++// Output goes to stderr and to <UserData>/Logs/hang_dump.txt. Intended for "window stays on the startup
++// screen but nothing crashes" situations.
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <sstream>
++#include <thread>
++
++#include "fiber_manager.h"
++#include "memory.h"
++#include "recomp_mod_loader.h"
++#include "runtime_config.h"
++#include "system_bridge.h"
++
++namespace {
++
++constexpr uint32_t kActiveThreadQueue = 0x800000DCu;  // __OSActiveThreadQueue {head, tail}
++constexpr uint32_t kThreadState = 0x2C8u;             // u16
++constexpr uint32_t kThreadPriority = 0x2D0u;
++constexpr uint32_t kThreadQueue = 0x2DCu;             // OSThreadQueue* the thread sleeps on
++constexpr uint32_t kThreadLinkActiveNext = 0x2FCu;
++
++const char* StateName(uint16_t s) {
++    switch (s) {
++        case 0: return "EXITED/NONE";
++        case 1: return "READY";
++        case 2: return "RUNNING";
++        case 4: return "WAITING";
++        case 8: return "MORIBUND";
++        default: return "?";
++    }
++}
++
++void DumpOnce(int index) {
++    std::ostringstream os;
++    os << "\n===== [hang-dump #" << index << "] =====\n";
++    os << "[hang-dump] current translated target: 0x" << std::hex
++       << RecompMod::CurrentTranslatedExecutionAddress()
++       << "  current guest thread: 0x" << Fiber::GuestFiberManager::GetCurrentGuestThread() << std::dec << "\n";
++    uint32_t t = 0;
++    if (!Memory::TryRead32(kActiveThreadQueue, t)) {
++        os << "[hang-dump] cannot read __OSActiveThreadQueue\n";
++    }
++    for (int guard = 0; t != 0 && guard < 64; ++guard) {
++        uint32_t prio = 0, queue = 0, next = 0;
++        uint16_t state = 0;
++        try {
++            state = Memory::Read16(t + kThreadState);
++            prio = Memory::Read32(t + kThreadPriority);
++            queue = Memory::Read32(t + kThreadQueue);
++            next = Memory::Read32(t + kThreadLinkActiveNext);
++        } catch (...) {
++            os << "[hang-dump] thread list broken at 0x" << std::hex << t << std::dec << "\n";
++            break;
++        }
++        os << "--- thread 0x" << std::hex << t << std::dec << " state=" << StateName(state)
++           << " prio=" << prio << " waitQueue=0x" << std::hex << queue << std::dec << "\n";
++        if (auto* fiber = Fiber::GuestFiberManager::GetFiber(t)) {
++            os << "    fiber entry=0x" << std::hex << fiber->entryPoint << std::dec
++               << (fiber->terminated ? " (terminated)" : "") << "\n";
++            SystemBridge::DumpCpuState(os, &fiber->cpuContext);
++        } else {
++            os << "    (no host fiber: main thread or not yet started)\n";
++        }
++        t = next;
++    }
++    const std::string text = os.str();
++    std::cerr << text << std::flush;
++    try {
++        const auto dir = RuntimeConfigFile::ApplicationDataDirectory() / "Logs";
++        std::filesystem::create_directories(dir);
++        std::ofstream(dir / "hang_dump.txt", std::ios::app) << text;
++    } catch (...) {
++    }
++}
++
++struct HangWatchdog {
++    HangWatchdog() {
++        const char* env = std::getenv("RESORT_HANG_DUMP");
++        if (!env || !*env) {
++            return;
++        }
++        const int seconds = std::max(2, std::atoi(env));
++        std::thread([seconds] {
++            for (int i = 1;; ++i) {
++                std::this_thread::sleep_for(std::chrono::seconds(seconds));
++                DumpOnce(i);
++            }
++        }).detach();
++    }
++};
++
++HangWatchdog g_hangWatchdog;
++
++} // namespace

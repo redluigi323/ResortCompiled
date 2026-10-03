@@ -1,0 +1,17 @@
+# Hand-identified Wii Sports Resort (RZTP01) functions, used by scripts/rekey.py before any automatic match.
+# Format: <hex address> <MKW symbol name as in WiiCompiled's MAP.txt>
+# SDK revision differences mean some functions were restructured (e.g. nandCreate inlined into NANDCreate),
+# so they don't match automatically. Each entry below was checked by disassembly.
+8003FE20 NAND::Create                  # nandIsInitialized, nandIsPrivatePath check, ISFS_CreateFile
+8003FF30 NAND::Private::Create         # same without the private-path check
+80040020 NAND::Private::CreateAsync    # ISFS_CreateFileAsync
+80040660 NAND::CreateDir               # ISFS_CreateDir + private-path check
+80040770 NAND::Private::CreateDir
+80040870 NAND::Private::CreateDirAsync # ISFS_CreateDirAsync
+# Not present in WSR (not linked): OS::JamMessage, VIGetNextField, contentFastOpenNAND, contentReadNAND
+80033BB0 GX::SetVtxDescv               # lwz r5,__GXData; li r7,0; li r8,1; b <loop> (extra nop vs MKW)
+800343D0 GX::SetVtxAttrFmtv            # MKW's entry stub + body merged into one function in WSR
+80035B10 GX::SetCoPlanar               # same as MKW plus 'sth r0,2(__GXData)' (bpSentNot = 0)
+# Not present in WSR: GX::InitTexObjLODBias (no room between InitTexObjFilter and InitTexObjUserData)
+# NOTE: WSR 0x80041E10 (li r6,0 ; b 0x80041E20) is NAND::SafeCloseAsync (identical to MKW 0x8019D720), matched
+# automatically. WSR's synchronous NANDSafeClose has not been located yet.

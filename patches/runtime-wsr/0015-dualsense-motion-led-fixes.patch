@@ -1,0 +1,207 @@
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -108,7 +108,7 @@
+ // Sign conventions of KPAD's MotionPlus output relative to our remote frame (X right, Y up out of the button
+ // face, Z towards the player; the remote points along -Z). Overridable with RESORT_MPLS_SIGNS="sx,sy,sz" and
+ // RESORT_MPLS_DIRSIGN=±1 while we confirm them against the game.
+-struct Conventions { double gyro[3] = {1, 1, 1}; double dir = 1; };
++struct Conventions { double gyro[3] = {-1, 1, 1}; double dir = 1; };
+ 
+ // ------------------------------------------------------------------------------------------------ math
+ struct Vec3 { double x = 0, y = 0, z = 0; };
+@@ -198,6 +198,10 @@
+     SDL_JoystickID activeGamepad = 0;
+     SDL_JoystickID sensorEnabledFor = 0;
+     SDL_JoystickID accelEnabledFor = 0;
++    Vec3 sensorGravity{0, -1, 0};
++    bool sensorGravityValid = false;
++    Vec3 peakAccel;
++    bool peakAccelValid = false;
+ };
+ 
+ Remote g_remote;
+@@ -270,6 +274,8 @@
+         g_remote.easeLeft = 0;
+         g_remote.tilting = false;
+         g_remote.wheelSteps = 0;
++        g_remote.sensorGravityValid = false;
++        g_remote.peakAccelValid = false;
+         if (in.window) SDL_SetWindowRelativeMouseMode(in.window, false);
+     }
+     if (pad && in.focused) {
+@@ -292,10 +298,20 @@
+             float acc[3]{};
+             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, acc, 3) &&
+                 std::isfinite(acc[0]) && std::isfinite(acc[1]) && std::isfinite(acc[2])) {
+-                in.acc = {-acc[0] / kGravity, -acc[1] / kGravity, -acc[2] / kGravity};
++                // A DualSense is normally held face-up: its +Z is the Wii
++                // Remote's button-face +Y, and its +Y points along the
++                // remote's -Z. SDL acceleration points opposite gravity.
++                in.acc = {-acc[0] / kGravity, -acc[2] / kGravity, acc[1] / kGravity};
+                 in.accValid = Len(in.acc) > 0.2 && Len(in.acc) < 5.0;
+             }
+         }
++        if (g_remote.peakAccelValid && g_remote.sensorGravityValid &&
++            (!in.accValid || Len(g_remote.peakAccel - g_remote.sensorGravity) >
++                                 Len(in.acc - g_remote.sensorGravity))) {
++            in.acc = g_remote.peakAccel;
++            in.accValid = true;
++        }
++        g_remote.peakAccelValid = false;
+         const auto button = [&](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
+         if (button(SDL_GAMEPAD_BUTTON_SOUTH)) in.hold |= kBtnA;
+         if (button(SDL_GAMEPAD_BUTTON_EAST) ||
+@@ -348,6 +364,19 @@
+     const uint32_t n = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(dt * kSampleHz)), 1u, maxSamples);
+ 
+     HostInput in = ReadHost();
++    Vec3 physicalMotion{};
++    if (in.controller && in.accValid) {
++        if (!r.sensorGravityValid) {
++            r.sensorGravity = in.acc;
++            r.sensorGravityValid = true;
++        }
++        physicalMotion = in.acc - r.sensorGravity;
++        // Only follow quiet posture changes. A swing must remain a transient
++        // acceleration rather than being absorbed into the gravity baseline.
++        if (Len(physicalMotion) < 0.35 && Len(in.gyro) < 0.4) {
++            r.sensorGravity = r.sensorGravity + physicalMotion * std::min(dt / 0.5, 1.0);
++        }
++    }
+ 
+     // Pointer / tilt target for the end of this frame.
+     const double startYaw = r.yaw, startPitch = r.pitch, startRoll = r.roll;
+@@ -399,7 +428,10 @@
+             }
+         }
+     }
+-    endPitch = std::clamp(endPitch, -kMaxPitch, kMaxPitch);
++    // The mouse is an aiming device; a physical pad must be free to complete a
++    // swing past vertical instead of losing all angular speed at the aim limit.
++    endPitch = in.controller ? std::remainder(endPitch, 2 * kPi)
++                             : std::clamp(endPitch, -kMaxPitch, kMaxPitch);
+     endYaw = std::remainder(endYaw, 2 * kPi);
+     endRoll = std::remainder(endRoll, 2 * kPi);
+ 
+@@ -426,7 +458,12 @@
+         const Vec3 lever{0, 0, -kLeverM};
+         const Vec3 aLin = Cross(alpha, lever) + Cross(s.gyro, Cross(s.gyro, lever));
+         s.acc = Apply(Transpose(s.R), Vec3{0, -1, 0}) - aLin * (1.0 / kGravity);
+-        if (in.controller && in.accValid) s.acc = in.acc;
++        if (in.controller && in.accValid) {
++            // The pad sensor sits near the hands; the Wii Remote accelerometer
++            // is farther from the grip. Keep the simulated gravity/rotation
++            // and add amplified linear motion from the physical sensor.
++            s.acc = s.acc + physicalMotion * 2.0;
++        }
+         if (r.shakeStart >= 0) {
+             const double ph = 2 * kPi * kShakeHz * (r.simTime - r.shakeStart);
+             s.acc = s.acc + Vec3{0, kShakeG * std::sin(ph), 0.5 * kShakeG * std::sin(ph)};
+@@ -541,7 +578,7 @@
+     Memory::Write8(a + guest::kRawErr, 0);
+     if (mpls) {
+         Memory::Write8(a + guest::kRawMpStat, 0x02);  // "valid" in fast/slow agnostic form
+-        Memory::Write16(a + guest::kRawMpPitch, static_cast<uint16_t>(RawGyro(s.gyro.x)));
++        Memory::Write16(a + guest::kRawMpPitch, static_cast<uint16_t>(RawGyro(-s.gyro.x)));
+         Memory::Write16(a + guest::kRawMpYaw, static_cast<uint16_t>(RawGyro(s.gyro.y)));
+         Memory::Write16(a + guest::kRawMpRoll, static_cast<uint16_t>(RawGyro(s.gyro.z)));
+     }
+@@ -562,6 +599,20 @@
+ }
+ 
+ void HandleSdlEvent(const SDL_Event& ev) {
++    if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && ev.gsensor.which == g_remote.activeGamepad &&
++        ev.gsensor.sensor == SDL_SENSOR_ACCEL && g_remote.sensorGravityValid &&
++        !InputBindings::InputBlocked()) {
++        const float* a = ev.gsensor.data;
++        if (std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2])) {
++            const Vec3 mapped{-a[0] / kGravity, -a[2] / kGravity, a[1] / kGravity};
++            if (Len(mapped) > 0.2 && Len(mapped) < 5.0 &&
++                (!g_remote.peakAccelValid ||
++                 Len(mapped - g_remote.sensorGravity) > Len(g_remote.peakAccel - g_remote.sensorGravity))) {
++                g_remote.peakAccel = mapped;
++                g_remote.peakAccelValid = true;
++            }
++        }
++    }
+     if (ev.type == SDL_EVENT_MOUSE_WHEEL && !DualSenseGamepad() && !InputBindings::InputBlocked()) {
+         const float y = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y : ev.wheel.y;
+         g_remote.wheelSteps += y;
+--- a/src/settings_overlay.cpp
++++ b/src/settings_overlay.cpp
+@@ -13,9 +13,11 @@
+ 
+ #include <imgui.h>
+ #include <SDL3/SDL_events.h>
++#include <SDL3/SDL_error.h>
+ #include <SDL3/SDL_gamepad.h>
+ #include <SDL3/SDL_keyboard.h>
+ #include <SDL3/SDL_mouse.h>
++#include <SDL3/SDL_properties.h>
+ #include <SDL3/SDL_scancode.h>
+ #include <SDL3/SDL_timer.h>
+ 
+@@ -76,6 +78,9 @@
+ bool g_topBarVisible = false;
+ bool g_exitPromptOpen = false;
+ bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
++bool g_dualSenseLedSupported = false;
++bool g_dualSenseLedRequestOk = false;
++std::string g_dualSenseLedError;
+ int g_controllerPort = 0;
+ float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
+ int g_audioVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::AudioVolume(1.0f) * 100.0f));
+@@ -965,7 +970,10 @@
+     if (pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+         ImGui::Text("Player 1: %s", SDL_GetGamepadName(pad));
+         ImGui::Text("Gyroscope: %s", SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? "available" : "unavailable");
+-        ImGui::Text("LED: %s", ResortWiimote::DualSenseActive() ? "aqua blue" : "inactive");
++        ImGui::Text("Accelerometer: %s", SDL_GamepadSensorEnabled(pad, SDL_SENSOR_ACCEL) ? "active" : "waiting");
++        ImGui::Text("RGB LED: %s", g_dualSenseLedSupported ?
++                    (g_dualSenseLedRequestOk ? "SDL accepted aqua blue" : "request failed") : "unsupported by SDL");
++        if (!g_dualSenseLedError.empty()) ImGui::TextDisabled("SDL: %s", g_dualSenseLedError.c_str());
+     } else {
+         ImGui::TextDisabled("Connect a DualSense with gyro for motion controls.");
+     }
+@@ -1550,6 +1558,7 @@
+     const SDL_JoystickID id = pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
+                               SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? SDL_GetGamepadID(pad) : 0;
+     static SDL_JoystickID litId = 0;
++    static uint64_t lastLedRequestMs = 0;
+     if (id != litId) {
+         if (litId != 0) {
+             if (SDL_Gamepad* previous = SDL_GetGamepadFromID(litId)) {
+@@ -1557,11 +1566,28 @@
+             }
+         }
+         litId = id;
+-        if (id != 0) {
+-            // Aurora owns the port LED state; set it there so PADRead does not
+-            // restore its default white after SDL receives our color.
+-            PADSetColor(0, 0, 220, 220);
+-            SDL_SetGamepadLED(pad, 0, 220, 220);
++        lastLedRequestMs = 0;
++        g_dualSenseLedSupported = id != 0 && SDL_GetBooleanProperty(
++            SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
++        g_dualSenseLedRequestOk = false;
++        g_dualSenseLedError.clear();
++    }
++    if (id != 0 && (lastLedRequestMs == 0 || SDL_GetTicks() - lastLedRequestMs >= 2000)) {
++        lastLedRequestMs = SDL_GetTicks();
++        // SDL's PS5 Bluetooth driver may defer the first LED effect until its
++        // connection animation/reset completes. Refresh it after that point.
++        // Keep Aurora's stored color aligned so PADRead cannot restore white.
++        PADSetColor(0, 0, 220, 220);
++        g_dualSenseLedRequestOk = SDL_SetGamepadLED(pad, 0, 220, 220);
++        if (!g_dualSenseLedRequestOk) {
++            const char* error = SDL_GetError();
++            const std::string message = error ? error : "unknown error";
++            if (message != g_dualSenseLedError) {
++                RT_LOG(RT_TAG_CONFIG) << "DualSense LED request failed: " << message << std::endl;
++            }
++            g_dualSenseLedError = message;
++        } else {
++            g_dualSenseLedError.clear();
+         }
+     }
+ }

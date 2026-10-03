@@ -1,0 +1,318 @@
+--- a/include/resort_wiimote.h
++++ b/include/resort_wiimote.h
+@@ -1,5 +1,5 @@
+ #pragma once
+-// Resortcompiled: keyboard + mouse virtual Wii Remote with MotionPlus (src/resort_wiimote_kbm.cpp).
++// Virtual Wii Remote with keyboard/mouse and DualSense input (src/resort_wiimote_kbm.cpp).
+ #include <cstdint>
+ 
+ union SDL_Event;
+@@ -8,6 +8,9 @@
+ // WPADProbe for the virtual remote; false when `chan` is not served by it.
+ bool Probe(uint32_t chan, uint32_t typePtr, int32_t& result);
+ bool IsVirtualRemote(uint32_t chan);
++// True when an assigned DualSense with a gyroscope drives player 1.
++bool DualSenseActive();
++const char* ActiveInputName();
+ // Mouse wheel (roll) and focus changes; called from the settings overlay's event loop.
+ void HandleSdlEvent(const SDL_Event& ev);
+ // True while the game window has focus, no overlay owns input and the virtual remote is in use.
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -1,4 +1,4 @@
+-// Resortcompiled: keyboard + mouse virtual Wii Remote with Wii MotionPlus, fed to WSR at the KPAD level.
++// Resortcompiled: virtual Wii Remote with Wii MotionPlus, fed to WSR at the KPAD level.
+ //
+ // WSR reads its remote through a newer KPAD (MotionPlus-aware) than Mario Kart Wii, so WiiCompiled's MKW
+ // KPAD HLE does not apply. What the game actually consumes (traced in main.dol):
+@@ -15,11 +15,12 @@
+ // Everything else in KPAD (calibration, direction revise, parameters) is left to the translated code; it only
+ // touches KPAD's own work areas, which the HLE read path no longer consults.
+ //
+-// Host side: the mouse is the IR pointer; holding Tilt turns mouse motion into remote rotation (the MotionPlus
+-// sees it, the pointer follows the projected aim), the wheel rolls; Shake adds an accelerometer shake.
++// Host side: keyboard/mouse or an SDL DualSense supplies buttons and motion. Mouse tilt or the pad gyroscope
++// rotates the remote (the MotionPlus sees it, the pointer follows the projected aim); Shake adds acceleration.
+ // Orientation is one rotation matrix, and gyro rate, angle, direction, accelerometer (gravity + motion of the
+ // remote's tip) and pointer are all derived from it, so the game sees a physically consistent remote.
+ #include <SDL3/SDL.h>
++#include <dolphin/pad.h>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -194,6 +195,9 @@
+     std::unordered_map<uint32_t, uint32_t> prevHoldByBuffer;   // KPAD reader buffer -> hold it last saw
+     bool log = false;
+     uint32_t recentCount = 0;
++    SDL_JoystickID activeGamepad = 0;
++    SDL_JoystickID sensorEnabledFor = 0;
++    SDL_JoystickID accelEnabledFor = 0;
+ };
+ 
+ Remote g_remote;
+@@ -212,13 +216,21 @@
+     LoadConventions();
+     g_remote.log = std::getenv("RESORT_WIIMOTE_LOG") != nullptr;
+     std::fprintf(stderr,
+-                 "[wiimote] keyboard+mouse Wii Remote + MotionPlus on channel 0\n"
++                 "[wiimote] virtual Wii Remote + MotionPlus on channel 0 (keyboard/mouse or DualSense)\n"
+                  "[wiimote]   pointer: mouse | A: left click / Z | B: right click / X | 1 / 2: 1 / 2\n"
+                  "[wiimote]   +: Enter / = | -: Backspace / - | Home: H | D-pad: arrows / WASD\n"
+                  "[wiimote]   tilt (MotionPlus): hold Left Shift or middle mouse and move the mouse, wheel rolls\n"
+                  "[wiimote]   shake: Space | recenter: R\n");
+ }
+ 
++SDL_Gamepad* DualSenseGamepad() {
++    const int32_t index = PADGetIndexForPort(0);
++    if (index < 0) return nullptr;
++    SDL_Gamepad* pad = PADGetSDLGamepadForIndex(static_cast<uint32_t>(index));
++    return pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
++                   SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? pad : nullptr;
++}
++
+ bool VirtualRemoteActive(uint32_t chan) {
+     // A real Bluetooth remote on the channel wins; the virtual one only stands in for channel 0.
+     return chan == 0 && !WiiRemoteInput::IsRemoteChannel(0);
+@@ -231,8 +243,12 @@
+ // ------------------------------------------------------------------------------------------------ host input
+ struct HostInput {
+     bool focused = false;
++    bool controller = false;
+     uint32_t hold = 0;
+     bool tilt = false, shake = false, recenter = false;
++    Vec3 gyro;
++    Vec3 acc;
++    bool accValid = false;
+     double mouseX = 0, mouseY = 0;   // -1..1, +y down
+     double relX = 0, relY = 0;       // pixels since last read
+     SDL_Window* window = nullptr;
+@@ -243,6 +259,60 @@
+     HostInput in;
+     in.window = SDL_GetKeyboardFocus();
+     in.focused = in.window != nullptr && !InputBindings::InputBlocked();
++    SDL_Gamepad* pad = DualSenseGamepad();
++    const SDL_JoystickID padId = pad ? SDL_GetGamepadID(pad) : 0;
++    if (padId != g_remote.activeGamepad) {
++        g_remote.activeGamepad = padId;
++        g_remote.yaw = g_remote.pitch = g_remote.roll = 0;
++        g_remote.prevR = Mat3{};
++        g_remote.prevGyro = {};
++        g_remote.angle = {};
++        g_remote.easeLeft = 0;
++        g_remote.tilting = false;
++        g_remote.wheelSteps = 0;
++        if (in.window) SDL_SetWindowRelativeMouseMode(in.window, false);
++    }
++    if (pad && in.focused) {
++        in.controller = true;
++        if (g_remote.sensorEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true)) {
++            g_remote.sensorEnabledFor = padId;
++        }
++        float gyro[3]{};
++        if (SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO) &&
++            SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3) &&
++            std::isfinite(gyro[0]) && std::isfinite(gyro[1]) && std::isfinite(gyro[2]) &&
++            std::max({std::fabs(gyro[0]), std::fabs(gyro[1]), std::fabs(gyro[2])}) < 30.0f) {
++            const auto deadzone = [](float value) { return std::fabs(value) < 0.025f ? 0.0 : static_cast<double>(value); };
++            in.gyro = {deadzone(gyro[0]), deadzone(gyro[1]), deadzone(gyro[2])};
++        }
++        if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
++            if (g_remote.accelEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
++                g_remote.accelEnabledFor = padId;
++            }
++            float acc[3]{};
++            if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, acc, 3) &&
++                std::isfinite(acc[0]) && std::isfinite(acc[1]) && std::isfinite(acc[2])) {
++                in.acc = {-acc[0] / kGravity, -acc[1] / kGravity, -acc[2] / kGravity};
++                in.accValid = Len(in.acc) > 0.2 && Len(in.acc) < 5.0;
++            }
++        }
++        const auto button = [&](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
++        if (button(SDL_GAMEPAD_BUTTON_SOUTH)) in.hold |= kBtnA;
++        if (button(SDL_GAMEPAD_BUTTON_EAST) ||
++            SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 10000) in.hold |= kBtnB;
++        if (button(SDL_GAMEPAD_BUTTON_WEST)) in.hold |= kBtn1;
++        if (button(SDL_GAMEPAD_BUTTON_NORTH)) in.hold |= kBtn2;
++        if (button(SDL_GAMEPAD_BUTTON_START)) in.hold |= kBtnPlus;
++        if (button(SDL_GAMEPAD_BUTTON_BACK)) in.hold |= kBtnMinus;
++        if (button(SDL_GAMEPAD_BUTTON_GUIDE)) in.hold |= kBtnHome;
++        if (button(SDL_GAMEPAD_BUTTON_DPAD_UP)) in.hold |= kBtnUp;
++        if (button(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) in.hold |= kBtnDown;
++        if (button(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) in.hold |= kBtnLeft;
++        if (button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) in.hold |= kBtnRight;
++        in.shake = button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
++        in.recenter = button(SDL_GAMEPAD_BUTTON_RIGHT_STICK);
++        return in;
++    }
+     float mx = 0, my = 0;
+     const SDL_MouseButtonFlags mouse = SDL_GetMouseState(&mx, &my);
+     float rx = 0, ry = 0;
+@@ -285,7 +355,14 @@
+     r.wheelSteps = 0;
+     if (in.recenter) endYaw = endPitch = endRoll = 0;
+ 
+-    if (in.focused && in.tilt) {
++    if (in.focused && in.controller) {
++        // SDL reports pitch, yaw and roll in radians per second in the pad's
++        // body frame. Integrate them into the same orientation used by the
++        // virtual remote's pointer, accelerometer and MotionPlus fields.
++        endPitch += in.gyro.x * dt;
++        endYaw -= in.gyro.y * dt;
++        endRoll -= in.gyro.z * dt;
++    } else if (in.focused && in.tilt) {
+         if (!r.tilting) {
+             r.tilting = true;
+             SDL_SetWindowRelativeMouseMode(in.window, true);
+@@ -349,6 +426,7 @@
+         const Vec3 lever{0, 0, -kLeverM};
+         const Vec3 aLin = Cross(alpha, lever) + Cross(s.gyro, Cross(s.gyro, lever));
+         s.acc = Apply(Transpose(s.R), Vec3{0, -1, 0}) - aLin * (1.0 / kGravity);
++        if (in.controller && in.accValid) s.acc = in.acc;
+         if (r.shakeStart >= 0) {
+             const double ph = 2 * kPi * kShakeHz * (r.simTime - r.shakeStart);
+             s.acc = s.acc + Vec3{0, kShakeG * std::sin(ph), 0.5 * kShakeG * std::sin(ph)};
+@@ -472,11 +550,19 @@
+ 
+ // ------------------------------------------------------------------------------------------------ public hooks
+ bool CursorShouldHide() {
+-    return VirtualRemoteActive(0) && SDL_GetKeyboardFocus() != nullptr && !InputBindings::InputBlocked();
++    return VirtualRemoteActive(0) && !DualSenseGamepad() && SDL_GetKeyboardFocus() != nullptr &&
++           !InputBindings::InputBlocked();
++}
++
++bool DualSenseActive() { return VirtualRemoteActive(0) && DualSenseGamepad() != nullptr; }
++
++const char* ActiveInputName() {
++    if (WiiRemoteInput::IsRemoteChannel(0)) return "Wii Remote (Bluetooth)";
++    return DualSenseActive() ? "DualSense gyro" : "Keyboard and mouse";
+ }
+ 
+ void HandleSdlEvent(const SDL_Event& ev) {
+-    if (ev.type == SDL_EVENT_MOUSE_WHEEL && !InputBindings::InputBlocked()) {
++    if (ev.type == SDL_EVENT_MOUSE_WHEEL && !DualSenseGamepad() && !InputBindings::InputBlocked()) {
+         const float y = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y : ev.wheel.y;
+         g_remote.wheelSteps += y;
+     }
+--- a/src/settings_overlay.cpp
++++ b/src/settings_overlay.cpp
+@@ -744,7 +744,7 @@
+     }
+ }
+ 
+-void DrawControllerSettings() {
++void DrawLegacyGameCubeSettings() {
+     for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
+         const std::string label = "Port " + std::to_string(port + 1);
+         ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
+@@ -767,7 +767,6 @@
+     }
+     ImGui::Separator();
+     controller_mapping_wizard::DrawSetupList();
+-    DrawWiiRemoteSettings(selectedGamePort);
+     const uint32_t controllerCount = PADCount();
+     if (controllerCount == 0) {
+         ImGui::TextDisabled("No controller connected");
+@@ -944,6 +943,54 @@
+     }
+     DrawExpressionSettings();
+     DrawRumbleSettings();
++}
++
++void DrawControllerSettings() {
++    ImGui::Text("Player 1 Wii Remote: %s", ResortWiimote::ActiveInputName());
++    ImGui::TextDisabled("Input changes automatically when a DualSense connects or disconnects.");
++
++    ImGui::SeparatorText("Keyboard and mouse");
++    ImGui::TextUnformatted("Pointer: mouse    A: left click or Z    B: right click or X");
++    ImGui::TextUnformatted("1 / 2: number keys    +: Enter    -: Backspace    Home: H");
++    ImGui::TextUnformatted("D-pad: arrows or WASD    Shake: Space    Recenter: R");
++    ImGui::TextUnformatted("MotionPlus tilt: hold Left Shift or middle click and move mouse");
++    ImGui::TextUnformatted("Roll: mouse wheel");
++
++    ImGui::SeparatorText("DualSense (SDL)");
++    ImGui::TextUnformatted("Pointer and MotionPlus: gyroscope    Recenter: R3    Shake: L1");
++    ImGui::TextUnformatted("A: Cross    B: Circle or R2    1: Square    2: Triangle");
++    ImGui::TextUnformatted("+: Options    -: Create    Home: PS button    D-pad: D-pad");
++    const int32_t index = PADGetIndexForPort(0);
++    SDL_Gamepad* pad = index >= 0 ? PADGetSDLGamepadForIndex(static_cast<uint32_t>(index)) : nullptr;
++    if (pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
++        ImGui::Text("Player 1: %s", SDL_GetGamepadName(pad));
++        ImGui::Text("Gyroscope: %s", SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? "available" : "unavailable");
++        ImGui::Text("LED: %s", ResortWiimote::DualSenseActive() ? "aqua blue" : "inactive");
++    } else {
++        ImGui::TextDisabled("Connect a DualSense with gyro for motion controls.");
++    }
++    if (!ResortWiimote::DualSenseActive() && !WiiRemoteInput::IsRemoteChannel(0)) {
++        for (uint32_t candidate = 0; candidate < PADCount(); ++candidate) {
++            SDL_Gamepad* available = PADGetSDLGamepadForIndex(candidate);
++            if (!available || SDL_GetGamepadType(available) != SDL_GAMEPAD_TYPE_PS5 ||
++                !SDL_GamepadHasSensor(available, SDL_SENSOR_GYRO)) continue;
++            ImGui::PushID(static_cast<int>(candidate));
++            if (ImGui::Button("Use DualSense for player 1")) {
++                PADSetPortForIndex(candidate, 0);
++                g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
++            }
++            ImGui::PopID();
++            break;
++        }
++    }
++
++    ImGui::SeparatorText("Wii Remote over Bluetooth");
++    DrawWiiRemoteSettings(0);
++    ImGui::Separator();
++    if (ImGui::BeginMenu("GameCube / other controller settings")) {
++        DrawLegacyGameCubeSettings();
++        ImGui::EndMenu();
++    }
+ }
+ 
+ void DrawAudioSettings() {
+@@ -1485,6 +1532,40 @@
+     if (queued) SDL_Delay(120);
+ }
+ 
++void UpdateDualSensePlayerOne() {
++    int32_t index = PADGetIndexForPort(0);
++    if (index < 0 && !WiiRemoteInput::IsRemoteChannel(0)) {
++        for (uint32_t candidate = 0; candidate < PADCount(); ++candidate) {
++            SDL_Gamepad* pad = PADGetSDLGamepadForIndex(candidate);
++            if (pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
++                SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
++                PADSetPortForIndex(candidate, 0);
++                index = static_cast<int32_t>(candidate);
++                g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
++                break;
++            }
++        }
++    }
++    SDL_Gamepad* pad = index >= 0 ? PADGetSDLGamepadForIndex(static_cast<uint32_t>(index)) : nullptr;
++    const SDL_JoystickID id = pad && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5 &&
++                              SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) ? SDL_GetGamepadID(pad) : 0;
++    static SDL_JoystickID litId = 0;
++    if (id != litId) {
++        if (litId != 0) {
++            if (SDL_Gamepad* previous = SDL_GetGamepadFromID(litId)) {
++                SDL_SetGamepadLED(previous, 0, 0, 0);
++            }
++        }
++        litId = id;
++        if (id != 0) {
++            // Aurora owns the port LED state; set it there so PADRead does not
++            // restore its default white after SDL receives our color.
++            PADSetColor(0, 0, 220, 220);
++            SDL_SetGamepadLED(pad, 0, 220, 220);
++        }
++    }
++}
++
+ void Draw() noexcept {
+     // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
+     // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
+@@ -1494,6 +1575,7 @@
+     // its "communications interrupted" prompt without polling pads). Same guest
+     // thread as PADRead, so no concurrent access to the scanner's state.
+     WiiRemoteInput::Poll();
++    UpdateDualSensePlayerOne();
+     ApplyConfiguredMappings();
+     PersistDisplayModeIfChanged();
+     UpdateCursorAutoHide();

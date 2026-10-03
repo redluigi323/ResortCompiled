@@ -1,0 +1,22 @@
+// Resortcompiled: sensor bar power (Hollywood GPIO) HLE.
+#include <cstdint>
+#include <cstdio>
+
+#include "hle_stubs.h"
+#include "ppc_runtime.h"
+
+// WSR func_80022F30 (WPAD library, next to WPADIsDpdEnabled): read-modify-write of HW_GPIOB_OUT
+// (0xCD0000C0) bit 8 = sensor bar power, returning the previous state. The game turns the sensor bar on
+// while building its first scene. There is no GPIO block on PC and the IR "sensor bar" is either a real one
+// powered by the user or emulated by the input layer, so only the state is tracked.
+static uint32_t g_sensorBarPower = 0;
+
+extern "C" uint32_t WPADSetSensorBarPower_HLE(uint32_t enable) {
+    const uint32_t previous = g_sensorBarPower;
+    g_sensorBarPower = enable ? 1u : 0u;
+    if (previous != g_sensorBarPower) {
+        std::fprintf(stderr, "[wpad] sensor bar power %s (HLE, no GPIO)\n", g_sensorBarPower ? "on" : "off");
+    }
+    return previous;
+}
+PPC_NATIVE_OVERRIDE(80022F30, WPADSetSensorBarPower_HLE, uint32_t, (uint32_t enable), (enable));

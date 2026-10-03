@@ -1,0 +1,8 @@
+# Hand-verified MKW -> WSR data/bss address pairs, used by scripts/rekey.py before automatic mapping.
+# Format: <MKW hex address> <WSR hex address>   # how it was verified
+# GX fifo objects (GXBeginDisplayList: base = lis/addi r31, then fields +0x80 / +0x680, same layout in both)
+80344090 8070CDE0   # DisplayList fifo object (r31 base in GXBeginDisplayList)
+80344110 8070CE60   # saved GXData copy (r31 + 0x80)
+80344710 8070D460   # old CPU fifo object (r31 + 0x680)
+803437C0 8070C510   # __GXData object: value of the __GXData pointer in .sdata2 (MKW 0x803886C8 / WSR 0x806F6D40)
+8027F820 806A1B60   # AX DSP ucode IRAM image (__AXOutInitDSP task +0xC; task +0x18 DRAM 0x8071E240 maps automatically)

@@ -1,0 +1,692 @@
+diff -ruN a/include/resort_wiimote.h b/include/resort_wiimote.h
+--- a/include/resort_wiimote.h	1969-12-31 19:30:00.000000000 -0430
++++ b/include/resort_wiimote.h	2026-09-30 20:01:50.146825919 -0400
+@@ -0,0 +1,15 @@
++#pragma once
++// Resortcompiled: keyboard + mouse virtual Wii Remote with MotionPlus (src/resort_wiimote_kbm.cpp).
++#include <cstdint>
++
++union SDL_Event;
++
++namespace ResortWiimote {
++// WPADProbe for the virtual remote; false when `chan` is not served by it.
++bool Probe(uint32_t chan, uint32_t typePtr, int32_t& result);
++bool IsVirtualRemote(uint32_t chan);
++// Mouse wheel (roll) and focus changes; called from the settings overlay's event loop.
++void HandleSdlEvent(const SDL_Event& ev);
++// True while the game window has focus, no overlay owns input and the virtual remote is in use.
++bool CursorShouldHide();
++}  // namespace ResortWiimote
+diff -ruN a/src/hle/input/wpad.cpp b/src/hle/input/wpad.cpp
+--- a/src/hle/input/wpad.cpp	2026-09-30 20:01:50.150717981 -0400
++++ b/src/hle/input/wpad.cpp	2026-09-30 20:01:50.164824376 -0400
+@@ -2,6 +2,7 @@
+ #include "memory.h"
+ #include "hle/controller_status_contract.h"
+ #include "wii_remote_input.h"
++#include "resort_wiimote.h"
+ 
+ #include <cstdint>
+ 
+@@ -119,6 +120,11 @@
+     // before the next PADRead, and only Poll() brings a dropped remote back.
+     WiiRemoteInput::Poll();
+ 
++    // Resortcompiled: keyboard + mouse virtual remote (with MotionPlus) when no real remote is on the channel.
++    if (int32_t virtualResult = 0; ResortWiimote::Probe(chan, typePtr, virtualResult)) {
++        return virtualResult;
++    }
++
+     // A real Bluetooth remote: WPAD_DEV_CORE (0) for a bare remote,
+     // WPAD_DEV_FREESTYLE (1) with a Nunchuk, WPAD_DEV_CLASSIC (2) with a Classic
+     // Controller. The game reads the type from here (not from
+@@ -156,6 +162,17 @@
+         return CompleteWpadRequest(chan, callback, WpadContract::kErrorBadChannel);
+     }
+ 
++    if (ResortWiimote::IsVirtualRemote(chan) && infoPtr != 0) {
++        // WPADInfo: dpd, speaker, attach, lowBat, nearempty (BOOL each), battery, led, protocol, firmware.
++        Memory::Write32(infoPtr + 0x00, 1);
++        Memory::Write32(infoPtr + 0x04, 0);
++        Memory::Write32(infoPtr + 0x08, 1);
++        Memory::Write32(infoPtr + 0x0C, 0);
++        Memory::Write32(infoPtr + 0x10, 0);
++        Memory::Write8(infoPtr + 0x14, 4);
++        Memory::Write8(infoPtr + 0x15, 1);
++        return CompleteWpadRequest(chan, callback, kStatusOk);
++    }
+     (void)infoPtr;
+     return CompleteWpadRequest(chan, callback, WpadContract::kErrorNoController);
+ }
+diff -ruN a/src/resort_wiimote_kbm.cpp b/src/resort_wiimote_kbm.cpp
+--- a/src/resort_wiimote_kbm.cpp	1969-12-31 19:30:00.000000000 -0430
++++ b/src/resort_wiimote_kbm.cpp	2026-09-30 21:10:39.878612425 -0400
+@@ -0,0 +1,597 @@
++// Resortcompiled: keyboard + mouse virtual Wii Remote with Wii MotionPlus, fed to WSR at the KPAD level.
++//
++// WSR reads its remote through a newer KPAD (MotionPlus-aware) than Mario Kart Wii, so WiiCompiled's MKW
++// KPAD HLE does not apply. What the game actually consumes (traced in main.dol):
++//
++//   KPADReadEx      0x800CB890  up to 16 KPADStatus (0xF0 each, newest first) per call; the controller
++//                               object at 0x80241324 reads chan 0 once per frame and uses every sample
++//   KPAD raw copy   0x800CD620  0x40-byte KPADUnifiedWpadStatus per sample; the game's MotionPlus / Nunchuk
++//                               subsystems only look at err (+0x29), dev (+0x28) and fmt (+0x3E) there:
++//                               MotionPlus is "present" when dev is 5..7 and fmt is 0x10 (WPAD_FMT_MPLS)
++//   WPAD MPLS mode  0x800242E0  the game switches MotionPlus on with KPADEnableMpls(chan, 4|5), which only
++//                               stores the wish in KPAD state (+0x659), then polls this until it matches
++//   WPADProbe       0x80020670  (wpad.cpp) connection + device type
++//
++// Everything else in KPAD (calibration, direction revise, parameters) is left to the translated code; it only
++// touches KPAD's own work areas, which the HLE read path no longer consults.
++//
++// Host side: the mouse is the IR pointer; holding Tilt turns mouse motion into remote rotation (the MotionPlus
++// sees it, the pointer follows the projected aim), the wheel rolls; Shake adds an accelerometer shake.
++// Orientation is one rotation matrix, and gyro rate, angle, direction, accelerometer (gravity + motion of the
++// remote's tip) and pointer are all derived from it, so the game sees a physically consistent remote.
++#include <SDL3/SDL.h>
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <unordered_map>
++
++#include "hle_stubs.h"
++#include "input_bindings.h"
++#include "memory.h"
++#include "ppc_runtime.h"
++#include "wii_remote_input.h"
++
++namespace ResortWiimote {
++
++// ------------------------------------------------------------------------------------------------ guest layout
++namespace guest {
++constexpr uint32_t kKpadStateBase = 0x8076A718u;   // per-channel KPAD state (lis 0x8077; addi -0x58E8)
++constexpr uint32_t kKpadStateStride = 0x668u;
++constexpr uint32_t kKpadMplsRequestedMode = 0x659u; // byte written by KPADEnableMpls / KPADDisableMpls
++
++constexpr uint32_t kStatusSize = 0xF0u;
++constexpr uint32_t kHold = 0x00, kTrig = 0x04, kRelease = 0x08, kAcc = 0x0C, kAccValue = 0x18,
++                   kAccSpeed = 0x1C, kPos = 0x20, kVec = 0x28, kSpeed = 0x30, kHorizon = 0x34,
++                   kHoriVec = 0x3C, kHoriSpeed = 0x44, kDist = 0x48, kDistVec = 0x4C, kDistSpeed = 0x50,
++                   kAccVertical = 0x54, kDevType = 0x5C, kWpadErr = 0x5D, kDpdValid = 0x5E, kDataFormat = 0x5F,
++                   kExStatus = 0x60, kMpls = 0xB0, kMplsAngle = 0xBC, kMplsDirX = 0xC8, kMplsDirY = 0xD4,
++                   kMplsDirZ = 0xE0, kTail = 0xEC;
++
++constexpr uint32_t kRawSize = 0x40u;
++constexpr uint32_t kRawButton = 0x00, kRawAcc = 0x02, kRawObj = 0x08, kRawDev = 0x28, kRawErr = 0x29,
++                   kRawMpStat = 0x36, kRawMpPitch = 0x38, kRawMpYaw = 0x3A, kRawMpRoll = 0x3C, kRawFmt = 0x3E;
++
++constexpr uint8_t kDevCore = 0, kDevMpls = 5;
++constexpr uint8_t kFmtCoreAccDpd = 2, kFmtMpls = 0x10;
++constexpr int32_t kKpadErrNone = 0, kKpadErrNoController = -2;
++}  // namespace guest
++
++// WPAD_BUTTON_* (core remote)
++enum : uint32_t {
++    kBtnLeft = 0x0001, kBtnRight = 0x0002, kBtnDown = 0x0004, kBtnUp = 0x0008, kBtnPlus = 0x0010,
++    kBtn2 = 0x0100, kBtn1 = 0x0200, kBtnB = 0x0400, kBtnA = 0x0800, kBtnMinus = 0x1000, kBtnHome = 0x8000,
++};
++
++// ------------------------------------------------------------------------------------------------ bindings
++// First pass: fixed defaults, printed at startup. (Config.toml remapping comes with the settings page.)
++struct KeyBinding { SDL_Scancode key; uint32_t button; };
++constexpr std::array<KeyBinding, 17> kKeyBindings = {{
++    {SDL_SCANCODE_Z, kBtnA},        {SDL_SCANCODE_X, kBtnB},
++    {SDL_SCANCODE_1, kBtn1},        {SDL_SCANCODE_2, kBtn2},
++    {SDL_SCANCODE_RETURN, kBtnPlus}, {SDL_SCANCODE_EQUALS, kBtnPlus},
++    {SDL_SCANCODE_MINUS, kBtnMinus}, {SDL_SCANCODE_BACKSPACE, kBtnMinus},
++    {SDL_SCANCODE_H, kBtnHome},
++    {SDL_SCANCODE_UP, kBtnUp},      {SDL_SCANCODE_DOWN, kBtnDown},
++    {SDL_SCANCODE_LEFT, kBtnLeft},  {SDL_SCANCODE_RIGHT, kBtnRight},
++    {SDL_SCANCODE_W, kBtnUp},       {SDL_SCANCODE_S, kBtnDown},
++    {SDL_SCANCODE_A, kBtnLeft},     {SDL_SCANCODE_D, kBtnRight},
++}};
++constexpr SDL_Scancode kKeyShake = SDL_SCANCODE_SPACE;
++constexpr SDL_Scancode kKeyTilt = SDL_SCANCODE_LSHIFT;
++constexpr SDL_Scancode kKeyRecenter = SDL_SCANCODE_R;
++// Mouse: left = A, right = B, middle = Tilt (same as Left Shift), wheel = roll.
++
++// ------------------------------------------------------------------------------------------------ tuning
++constexpr double kPi = 3.14159265358979323846;
++constexpr double kDeg = kPi / 180.0;
++constexpr double kSampleHz = 200.0;              // Wii Remote report rate KPAD sees
++constexpr double kHalfFovX = 20.0 * kDeg;        // yaw that takes the pointer to the screen edge
++constexpr double kHalfFovY = 15.0 * kDeg;
++constexpr double kTiltDegPerPixel = 0.35;        // mouse sensitivity while tilting
++constexpr double kRollDegPerWheelStep = 12.0;
++constexpr double kMaxPitch = 85.0 * kDeg;
++constexpr double kReturnTau = 0.08;              // seconds; ease back to the mouse pointer after a tilt
++constexpr double kShakeHz = 6.0;
++constexpr double kShakeG = 2.6;
++constexpr double kLeverM = 0.12;                 // wrist -> accelerometer distance for motion acceleration
++constexpr double kGravity = 9.81;
++constexpr double kMplsUnitRadPerSec = 2.0 * kPi; // KPAD mpls/angle: 1.0 = one revolution (per second)
++constexpr float kDist = 1.5f;                    // metres to the sensor bar
++
++// Sign conventions of KPAD's MotionPlus output relative to our remote frame (X right, Y up out of the button
++// face, Z towards the player; the remote points along -Z). Overridable with RESORT_MPLS_SIGNS="sx,sy,sz" and
++// RESORT_MPLS_DIRSIGN=±1 while we confirm them against the game.
++struct Conventions { double gyro[3] = {1, 1, 1}; double dir = 1; };
++
++// ------------------------------------------------------------------------------------------------ math
++struct Vec3 { double x = 0, y = 0, z = 0; };
++struct Mat3 { double m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}; };
++
++Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
++Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
++Vec3 operator*(Vec3 a, double s) { return {a.x * s, a.y * s, a.z * s}; }
++Vec3 Cross(Vec3 a, Vec3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
++double Len(Vec3 a) { return std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
++
++Mat3 Mul(const Mat3& a, const Mat3& b) {
++    Mat3 r;
++    for (int i = 0; i < 3; ++i)
++        for (int j = 0; j < 3; ++j) {
++            r.m[i][j] = 0;
++            for (int k = 0; k < 3; ++k) r.m[i][j] += a.m[i][k] * b.m[k][j];
++        }
++    return r;
++}
++Mat3 Transpose(const Mat3& a) {
++    Mat3 r;
++    for (int i = 0; i < 3; ++i)
++        for (int j = 0; j < 3; ++j) r.m[i][j] = a.m[j][i];
++    return r;
++}
++Vec3 Apply(const Mat3& a, Vec3 v) {
++    return {a.m[0][0] * v.x + a.m[0][1] * v.y + a.m[0][2] * v.z, a.m[1][0] * v.x + a.m[1][1] * v.y + a.m[1][2] * v.z,
++            a.m[2][0] * v.x + a.m[2][1] * v.y + a.m[2][2] * v.z};
++}
++Vec3 Column(const Mat3& a, int c) { return {a.m[0][c], a.m[1][c], a.m[2][c]}; }
++Mat3 RotX(double t) { Mat3 r; r.m[1][1] = std::cos(t); r.m[1][2] = -std::sin(t); r.m[2][1] = std::sin(t); r.m[2][2] = std::cos(t); return r; }
++Mat3 RotY(double t) { Mat3 r; r.m[0][0] = std::cos(t); r.m[0][2] = std::sin(t); r.m[2][0] = -std::sin(t); r.m[2][2] = std::cos(t); return r; }
++Mat3 RotZ(double t) { Mat3 r; r.m[0][0] = std::cos(t); r.m[0][1] = -std::sin(t); r.m[1][0] = std::sin(t); r.m[1][1] = std::cos(t); return r; }
++
++// Remote -> world rotation from aim angles: yaw right+, pitch up+, roll right (clockwise as seen by the player)+.
++Mat3 Orientation(double yaw, double pitch, double roll) { return Mul(Mul(RotY(-yaw), RotX(pitch)), RotZ(-roll)); }
++
++// Body-frame angular velocity (rad/s) that takes `a` to `b` in `dt` seconds.
++Vec3 AngularVelocity(const Mat3& a, const Mat3& b, double dt) {
++    const Mat3 d = Mul(Transpose(a), b);
++    Vec3 w{(d.m[2][1] - d.m[1][2]) * 0.5, (d.m[0][2] - d.m[2][0]) * 0.5, (d.m[1][0] - d.m[0][1]) * 0.5};
++    const double s = Len(w);
++    if (s > 1e-9) {
++        const double c = std::clamp((d.m[0][0] + d.m[1][1] + d.m[2][2] - 1.0) * 0.5, -1.0, 1.0);
++        w = w * (std::atan2(s, c) / s);
++    }
++    return w * (1.0 / dt);
++}
++
++// ------------------------------------------------------------------------------------------------ state
++struct Sample {
++    uint32_t hold = 0;
++    Mat3 R;                 // remote -> world
++    Vec3 gyro;              // body rad/s
++    Vec3 acc;               // KPAD acc (g, "gravity direction" convention: (0,-1,0) at rest)
++    double posX = 0, posY = 0;
++    bool pointerValid = false;
++    double roll = 0;
++};
++
++struct Remote {
++    bool announced = false;
++    Conventions conv;
++    // aim
++    double yaw = 0, pitch = 0, roll = 0;
++    bool tilting = false;
++    double easeLeft = 0;         // seconds of easing back to the mouse after a tilt
++    double wheelSteps = 0;
++    // time
++    std::chrono::steady_clock::time_point lastRead{};
++    double simTime = 0;          // seconds of simulated remote time
++    double shakeStart = -1;
++    // derived history
++    Sample last;
++    Mat3 prevR;
++    Vec3 prevGyro;
++    Vec3 angle;                  // integrated, KPAD units
++    uint32_t prevHold = 0;
++    double prevPosX = 0, prevPosY = 0, prevDist = kDist;
++    // newest-first ring of generated samples for the raw copy
++    std::array<Sample, 16> recent{};
++    std::chrono::steady_clock::time_point lastStep{};
++    std::unordered_map<uint32_t, uint32_t> prevHoldByBuffer;   // KPAD reader buffer -> hold it last saw
++    bool log = false;
++    uint32_t recentCount = 0;
++};
++
++Remote g_remote;
++
++void LoadConventions() {
++    if (const char* s = std::getenv("RESORT_MPLS_SIGNS")) {
++        double a = 1, b = 1, c = 1;
++        if (std::sscanf(s, "%lf,%lf,%lf", &a, &b, &c) == 3) g_remote.conv.gyro[0] = a, g_remote.conv.gyro[1] = b, g_remote.conv.gyro[2] = c;
++    }
++    if (const char* s = std::getenv("RESORT_MPLS_DIRSIGN")) g_remote.conv.dir = std::atof(s) < 0 ? -1 : 1;
++}
++
++void Announce() {
++    if (g_remote.announced) return;
++    g_remote.announced = true;
++    LoadConventions();
++    g_remote.log = std::getenv("RESORT_WIIMOTE_LOG") != nullptr;
++    std::fprintf(stderr,
++                 "[wiimote] keyboard+mouse Wii Remote + MotionPlus on channel 0\n"
++                 "[wiimote]   pointer: mouse | A: left click / Z | B: right click / X | 1 / 2: 1 / 2\n"
++                 "[wiimote]   +: Enter / = | -: Backspace / - | Home: H | D-pad: arrows / WASD\n"
++                 "[wiimote]   tilt (MotionPlus): hold Left Shift or middle mouse and move the mouse, wheel rolls\n"
++                 "[wiimote]   shake: Space | recenter: R\n");
++}
++
++bool VirtualRemoteActive(uint32_t chan) {
++    // A real Bluetooth remote on the channel wins; the virtual one only stands in for channel 0.
++    return chan == 0 && !WiiRemoteInput::IsRemoteChannel(0);
++}
++
++uint8_t RequestedMplsMode(uint32_t chan) {
++    return Memory::Read8(guest::kKpadStateBase + chan * guest::kKpadStateStride + guest::kKpadMplsRequestedMode);
++}
++
++// ------------------------------------------------------------------------------------------------ host input
++struct HostInput {
++    bool focused = false;
++    uint32_t hold = 0;
++    bool tilt = false, shake = false, recenter = false;
++    double mouseX = 0, mouseY = 0;   // -1..1, +y down
++    double relX = 0, relY = 0;       // pixels since last read
++    SDL_Window* window = nullptr;
++    int w = 1, h = 1;
++};
++
++HostInput ReadHost() {
++    HostInput in;
++    in.window = SDL_GetKeyboardFocus();
++    in.focused = in.window != nullptr && !InputBindings::InputBlocked();
++    float mx = 0, my = 0;
++    const SDL_MouseButtonFlags mouse = SDL_GetMouseState(&mx, &my);
++    float rx = 0, ry = 0;
++    SDL_GetRelativeMouseState(&rx, &ry);
++    if (!in.focused) return in;
++    SDL_GetWindowSize(in.window, &in.w, &in.h);
++    in.mouseX = std::clamp(2.0 * mx / std::max(1, in.w) - 1.0, -1.0, 1.0);
++    in.mouseY = std::clamp(2.0 * my / std::max(1, in.h) - 1.0, -1.0, 1.0);
++    in.relX = rx;
++    in.relY = ry;
++    int count = 0;
++    const bool* keys = SDL_GetKeyboardState(&count);
++    auto down = [&](SDL_Scancode s) { return keys && s < count && keys[s]; };
++    for (const auto& b : kKeyBindings)
++        if (down(b.key)) in.hold |= b.button;
++    if (mouse & SDL_BUTTON_LMASK) in.hold |= kBtnA;
++    if (mouse & SDL_BUTTON_RMASK) in.hold |= kBtnB;
++    in.tilt = down(kKeyTilt) || (mouse & SDL_BUTTON_MMASK);
++    in.shake = down(kKeyShake);
++    in.recenter = down(kKeyRecenter);
++    return in;
++}
++
++// ------------------------------------------------------------------------------------------------ simulation
++// Advances the remote by one frame of host input and returns how many 200 Hz samples to emit.
++uint32_t Step(uint32_t maxSamples) {
++    Remote& r = g_remote;
++    const auto now = std::chrono::steady_clock::now();
++    double dt = r.lastRead.time_since_epoch().count() == 0 ? 1.0 / 60.0
++                                                           : std::chrono::duration<double>(now - r.lastRead).count();
++    r.lastRead = now;
++    dt = std::clamp(dt, 1.0 / kSampleHz, 0.1);
++    const uint32_t n = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(dt * kSampleHz)), 1u, maxSamples);
++
++    HostInput in = ReadHost();
++
++    // Pointer / tilt target for the end of this frame.
++    const double startYaw = r.yaw, startPitch = r.pitch, startRoll = r.roll;
++    double endYaw = r.yaw, endPitch = r.pitch, endRoll = r.roll + r.wheelSteps * kRollDegPerWheelStep * kDeg;
++    r.wheelSteps = 0;
++    if (in.recenter) endYaw = endPitch = endRoll = 0;
++
++    if (in.focused && in.tilt) {
++        if (!r.tilting) {
++            r.tilting = true;
++            SDL_SetWindowRelativeMouseMode(in.window, true);
++            in.relX = in.relY = 0;  // drop the jump from switching modes
++        }
++        endYaw += in.relX * kTiltDegPerPixel * kDeg;
++        endPitch -= in.relY * kTiltDegPerPixel * kDeg;
++    } else {
++        if (r.tilting) {
++            r.tilting = false;
++            r.easeLeft = 0.25;
++            if (in.window) {
++                SDL_SetWindowRelativeMouseMode(in.window, false);
++                // Put the OS cursor where the remote now points, so easing back causes no jump.
++                const double px = std::tan(r.yaw) / std::tan(kHalfFovX), py = -std::tan(r.pitch) / std::tan(kHalfFovY);
++                if (std::fabs(px) <= 1 && std::fabs(py) <= 1)
++                    SDL_WarpMouseInWindow(in.window, static_cast<float>((px + 1) * 0.5 * in.w),
++                                          static_cast<float>((py + 1) * 0.5 * in.h));
++            }
++        }
++        if (in.focused) {
++            // The pointer follows the mouse 1:1; only right after a tilt (aim may be off-screen) ease back so the
++            // MotionPlus does not report a violent snap.
++            const double targetYaw = std::atan(in.mouseX * std::tan(kHalfFovX));
++            const double targetPitch = std::atan(-in.mouseY * std::tan(kHalfFovY));
++            if (r.easeLeft > 0) {
++                const double k = 1.0 - std::exp(-dt / kReturnTau);
++                endYaw += std::remainder(targetYaw - endYaw, 2 * kPi) * k;
++                endPitch += (targetPitch - endPitch) * k;
++                r.easeLeft -= dt;
++            } else {
++                endYaw = targetYaw;
++                endPitch = targetPitch;
++            }
++        }
++    }
++    endPitch = std::clamp(endPitch, -kMaxPitch, kMaxPitch);
++    endYaw = std::remainder(endYaw, 2 * kPi);
++    endRoll = std::remainder(endRoll, 2 * kPi);
++
++    if (in.shake && r.shakeStart < 0) r.shakeStart = r.simTime;
++    if (!in.shake) r.shakeStart = -1;
++
++    // Generate n samples across the frame, oldest first, then store newest first.
++    std::array<Sample, 16> gen{};
++    const double sdt = dt / n;
++    for (uint32_t i = 0; i < n; ++i) {
++        const double t = static_cast<double>(i + 1) / n;
++        Sample s;
++        s.hold = in.hold;
++        const double yaw = startYaw + std::remainder(endYaw - startYaw, 2 * kPi) * t;
++        const double pitch = startPitch + (endPitch - startPitch) * t;
++        const double roll = startRoll + std::remainder(endRoll - startRoll, 2 * kPi) * t;
++        s.R = Orientation(yaw, pitch, roll);
++        s.roll = roll;
++        s.gyro = AngularVelocity(r.prevR, s.R, sdt);
++        r.simTime += sdt;
++
++        // Accelerometer: gravity direction in the remote frame, minus the motion of the tip (lever along -Z).
++        const Vec3 alpha = (s.gyro - r.prevGyro) * (1.0 / sdt);
++        const Vec3 lever{0, 0, -kLeverM};
++        const Vec3 aLin = Cross(alpha, lever) + Cross(s.gyro, Cross(s.gyro, lever));
++        s.acc = Apply(Transpose(s.R), Vec3{0, -1, 0}) - aLin * (1.0 / kGravity);
++        if (r.shakeStart >= 0) {
++            const double ph = 2 * kPi * kShakeHz * (r.simTime - r.shakeStart);
++            s.acc = s.acc + Vec3{0, kShakeG * std::sin(ph), 0.5 * kShakeG * std::sin(ph)};
++        }
++
++        // Pointer: where the aim ray crosses the screen plane.
++        const Vec3 fwd = Column(s.R, 2) * -1.0;
++        if (fwd.z < -0.2) {
++            const double ax = std::atan2(fwd.x, -fwd.z), ay = std::atan2(fwd.y, -fwd.z);
++            s.posX = std::tan(ax) / std::tan(kHalfFovX);
++            s.posY = -std::tan(ay) / std::tan(kHalfFovY);
++            s.pointerValid = std::fabs(s.posX) <= 1.15 && std::fabs(s.posY) <= 1.15;
++        }
++        r.angle = r.angle + s.gyro * (sdt / kMplsUnitRadPerSec);
++        r.prevR = s.R;
++        r.prevGyro = s.gyro;
++        gen[i] = s;
++    }
++    r.yaw = endYaw;
++    r.pitch = endPitch;
++    r.roll = endRoll;
++    for (uint32_t i = 0; i < n; ++i) r.recent[i] = gen[n - 1 - i];
++    r.recentCount = n;
++    return n;
++}
++
++// ------------------------------------------------------------------------------------------------ guest writes
++void WriteVec3(uint32_t a, Vec3 v) {
++    Memory::WriteFloat32(a, static_cast<float>(v.x));
++    Memory::WriteFloat32(a + 4, static_cast<float>(v.y));
++    Memory::WriteFloat32(a + 8, static_cast<float>(v.z));
++}
++void WriteVec2(uint32_t a, double x, double y) {
++    Memory::WriteFloat32(a, static_cast<float>(x));
++    Memory::WriteFloat32(a + 4, static_cast<float>(y));
++}
++void Zero(uint32_t a, uint32_t size) {
++    for (uint32_t o = 0; o < size; o += 4) Memory::Write32(a + o, 0);
++}
++
++void WriteStatus(uint32_t a, const Sample& s, const Sample* older, bool mpls, uint32_t& prevHold) {
++    Remote& r = g_remote;
++    Zero(a, guest::kStatusSize);
++    Memory::Write32(a + guest::kHold, s.hold);
++    Memory::Write32(a + guest::kTrig, s.hold & ~prevHold);
++    Memory::Write32(a + guest::kRelease, prevHold & ~s.hold);
++    prevHold = s.hold;
++
++    WriteVec3(a + guest::kAcc, s.acc);
++    Memory::WriteFloat32(a + guest::kAccValue, static_cast<float>(Len(s.acc)));
++    Memory::WriteFloat32(a + guest::kAccSpeed, static_cast<float>(older ? Len(s.acc - older->acc) : 0.0));
++
++    if (s.pointerValid) {
++        const double vx = s.posX - r.prevPosX, vy = s.posY - r.prevPosY;
++        WriteVec2(a + guest::kPos, s.posX, s.posY);
++        WriteVec2(a + guest::kVec, vx, vy);
++        Memory::WriteFloat32(a + guest::kSpeed, static_cast<float>(std::sqrt(vx * vx + vy * vy)));
++        r.prevPosX = s.posX;
++        r.prevPosY = s.posY;
++    } else {
++        WriteVec2(a + guest::kPos, r.prevPosX, r.prevPosY);
++    }
++    WriteVec2(a + guest::kHorizon, std::cos(s.roll), -std::sin(s.roll));
++    Memory::WriteFloat32(a + guest::kDist, kDist);
++    // acc_vertical: the gravity direction projected on the remote's Y/Z plane.
++    WriteVec2(a + guest::kAccVertical, -s.acc.y, s.acc.z);
++
++    Memory::Write8(a + guest::kDevType, mpls ? guest::kDevMpls : guest::kDevCore);
++    Memory::Write8(a + guest::kWpadErr, 0);
++    Memory::Write8(a + guest::kDpdValid, s.pointerValid ? 2 : 0);
++    Memory::Write8(a + guest::kDataFormat, mpls ? guest::kFmtMpls : guest::kFmtCoreAccDpd);
++
++    if (mpls) {
++        const Conventions& c = r.conv;
++        const Vec3 g{s.gyro.x * c.gyro[0], s.gyro.y * c.gyro[1], s.gyro.z * c.gyro[2]};
++        WriteVec3(a + guest::kMpls, g * (1.0 / kMplsUnitRadPerSec));
++        WriteVec3(a + guest::kMplsAngle, Vec3{r.angle.x * c.gyro[0], r.angle.y * c.gyro[1], r.angle.z * c.gyro[2]});
++        WriteVec3(a + guest::kMplsDirX, Column(s.R, 0) * c.dir);
++        WriteVec3(a + guest::kMplsDirY, Column(s.R, 1) * c.dir);
++        WriteVec3(a + guest::kMplsDirZ, Column(s.R, 2) * c.dir);
++    }
++}
++
++uint16_t RawAcc(double g) { return static_cast<uint16_t>(std::clamp(512.0 + g * 100.0, 0.0, 1023.0)); }
++int16_t RawGyro(double radPerSec) {
++    return static_cast<int16_t>(std::clamp(radPerSec / kDeg * 16.0, -8191.0, 8191.0));
++}
++
++void WriteRaw(uint32_t a, const Sample& s, bool mpls) {
++    Zero(a, guest::kRawSize);
++    Memory::Write16(a + guest::kRawButton, static_cast<uint16_t>(s.hold & 0xFFFF));
++    Memory::Write16(a + guest::kRawAcc + 0, RawAcc(-s.acc.x));
++    Memory::Write16(a + guest::kRawAcc + 2, RawAcc(-s.acc.z));
++    Memory::Write16(a + guest::kRawAcc + 4, RawAcc(-s.acc.y));
++    // Two sensor-bar dots on the IR camera (1024x768), mirrored like the real camera image.
++    for (uint32_t i = 0; i < 4; ++i) {
++        const uint32_t o = a + guest::kRawObj + i * 8;
++        if (i < 2 && s.pointerValid) {
++            const double side = i == 0 ? -1.0 : 1.0;
++            const double cx = 512.0 - s.posX * 384.0, cy = 384.0 - s.posY * 288.0;
++            const double dx = side * 90.0 * std::cos(s.roll), dy = side * 90.0 * std::sin(s.roll);
++            Memory::Write16(o + 0, static_cast<uint16_t>(std::clamp(cx + dx, 0.0, 1023.0)));
++            Memory::Write16(o + 2, static_cast<uint16_t>(std::clamp(cy + dy, 0.0, 767.0)));
++            Memory::Write16(o + 4, 4);
++            Memory::Write8(o + 6, static_cast<uint8_t>(i));
++        } else {
++            Memory::Write16(o + 0, 0x3FF);
++            Memory::Write16(o + 2, 0x3FF);
++        }
++    }
++    Memory::Write8(a + guest::kRawDev, mpls ? guest::kDevMpls : guest::kDevCore);
++    Memory::Write8(a + guest::kRawErr, 0);
++    if (mpls) {
++        Memory::Write8(a + guest::kRawMpStat, 0x02);  // "valid" in fast/slow agnostic form
++        Memory::Write16(a + guest::kRawMpPitch, static_cast<uint16_t>(RawGyro(s.gyro.x)));
++        Memory::Write16(a + guest::kRawMpYaw, static_cast<uint16_t>(RawGyro(s.gyro.y)));
++        Memory::Write16(a + guest::kRawMpRoll, static_cast<uint16_t>(RawGyro(s.gyro.z)));
++    }
++    Memory::Write8(a + guest::kRawFmt, mpls ? guest::kFmtMpls : guest::kFmtCoreAccDpd);
++}
++
++// ------------------------------------------------------------------------------------------------ public hooks
++bool CursorShouldHide() {
++    return VirtualRemoteActive(0) && SDL_GetKeyboardFocus() != nullptr && !InputBindings::InputBlocked();
++}
++
++void HandleSdlEvent(const SDL_Event& ev) {
++    if (ev.type == SDL_EVENT_MOUSE_WHEEL && !InputBindings::InputBlocked()) {
++        const float y = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y : ev.wheel.y;
++        g_remote.wheelSteps += y;
++    }
++    if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST && g_remote.tilting) {
++        g_remote.tilting = false;
++        if (SDL_Window* w = SDL_GetWindowFromID(ev.window.windowID)) SDL_SetWindowRelativeMouseMode(w, false);
++    }
++}
++
++// WPADProbe for the virtual remote. Returns false when chan is not ours.
++bool Probe(uint32_t chan, uint32_t typePtr, int32_t& result) {
++    if (!VirtualRemoteActive(chan)) return false;
++    Announce();
++    if (typePtr) Memory::Write32(typePtr, RequestedMplsMode(chan) != 0 ? guest::kDevMpls : guest::kDevCore);
++    result = 0;
++    return true;
++}
++
++bool IsVirtualRemote(uint32_t chan) { return VirtualRemoteActive(chan); }
++
++}  // namespace ResortWiimote
++
++using namespace ResortWiimote;
++
++// KPADReadEx(chan, KPADStatus* buf, u32 len, s32* err, BOOL keepLastOnNoData) -> number of samples
++extern "C" int32_t KPADReadEx_HLE(uint32_t chan, uint32_t buf, uint32_t len, uint32_t errPtr, uint32_t keepLast) {
++    (void)keepLast;
++    int32_t err = guest::kKpadErrNone;
++    int32_t written = 0;
++    try {
++        if (!VirtualRemoteActive(chan) || buf == 0 || len == 0) {
++            err = guest::kKpadErrNoController;
++            if (buf != 0 && len != 0) {
++                Zero(buf, guest::kStatusSize);
++                Memory::Write8(buf + guest::kDevType, 0xFD);   // WPAD_DEV_NOT_FOUND, as KPAD does
++                Memory::Write8(buf + guest::kWpadErr, 0xFF);
++            }
++        } else {
++            Announce();
++            const bool mpls = RequestedMplsMode(chan) != 0;
++            // Several readers poll KPAD every frame (EGG::CoreController at 0x801C4728 and the game's own
++            // controller at 0x802412F8, each with its own buffer). Advance the remote once per frame and hand every
++            // reader the same samples; button edges are tracked per reader buffer so each one sees the press.
++            const auto now = std::chrono::steady_clock::now();
++            if (g_remote.recentCount == 0 || now - g_remote.lastStep > std::chrono::milliseconds(4)) {
++                Step(16);
++                g_remote.lastStep = now;
++            }
++            const uint32_t n = std::min<uint32_t>(std::min<uint32_t>(len, 16), g_remote.recentCount);
++            // Buttons are sampled once per host frame, so every sample of this read has the same hold. The game
++            // (0x80241670) takes hold/trig/release from status[0] only, so the edge for this frame goes on the
++            // newest sample; the older ones carry hold with no edges (no double presses for code that ORs them).
++            uint32_t& readerPrevHold = g_remote.prevHoldByBuffer[buf];
++            for (int32_t i = static_cast<int32_t>(n) - 1; i >= 0; --i) {
++                const Sample* older = (i + 1 < static_cast<int32_t>(n)) ? &g_remote.recent[i + 1] : nullptr;
++                uint32_t edgeBase = i == 0 ? readerPrevHold : g_remote.recent[i].hold;
++                WriteStatus(buf + static_cast<uint32_t>(i) * guest::kStatusSize, g_remote.recent[i], older, mpls,
++                            edgeBase);
++            }
++            if (g_remote.log && g_remote.recent[0].hold != readerPrevHold) {
++                std::fprintf(stderr, "[wiimote] read buf=0x%08X n=%u hold 0x%04X -> 0x%04X mpls=%d ptr=(%.2f,%.2f)%s\n",
++                             buf, n, readerPrevHold, g_remote.recent[0].hold, mpls ? 1 : 0, g_remote.recent[0].posX,
++                             g_remote.recent[0].posY, g_remote.recent[0].pointerValid ? "" : " offscreen");
++            }
++            readerPrevHold = g_remote.recent[0].hold;
++            // KPAD keeps a copy of the newest status at the start of its channel state.
++            const uint32_t state = guest::kKpadStateBase + chan * guest::kKpadStateStride;
++            for (uint32_t o = 0; o < guest::kStatusSize; o += 4) Memory::Write32(state + o, Memory::Read32(buf + o));
++            written = static_cast<int32_t>(n);
++        }
++        if (errPtr) Memory::Write32(errPtr, static_cast<uint32_t>(err));
++    } catch (const Memory::AccessViolation&) {
++        return 0;
++    }
++    return written;
++}
++PPC_NATIVE_OVERRIDE(800CB890, KPADReadEx_HLE, int32_t,
++                    (uint32_t chan, uint32_t buf, uint32_t len, uint32_t errPtr, uint32_t keepLast),
++                    (chan, buf, len, errPtr, keepLast));
++
++// KPAD raw sample copy (KPADGetUnifiedWpadStatus): count 0x40-byte samples, newest first.
++extern "C" void KPADGetUnifiedWpadStatus_HLE(uint32_t chan, uint32_t dst, uint32_t count) {
++    try {
++        count = std::min<uint32_t>(count, 16);
++        const bool active = VirtualRemoteActive(chan);
++        const bool mpls = active && RequestedMplsMode(chan) != 0;
++        for (uint32_t i = 0; i < count; ++i) {
++            const uint32_t a = dst + i * guest::kRawSize;
++            if (!active) {
++                Zero(a, guest::kRawSize);
++                Memory::Write8(a + guest::kRawDev, 0xFD);
++                Memory::Write8(a + guest::kRawErr, 0xFF);  // WPAD_ERR_NO_CONTROLLER
++                continue;
++            }
++            const uint32_t idx = std::min(i, g_remote.recentCount ? g_remote.recentCount - 1 : 0);
++            WriteRaw(a, g_remote.recent[idx], mpls);
++        }
++    } catch (const Memory::AccessViolation&) {
++    }
++}
++PPC_NATIVE_OVERRIDE_VOID(800CD620, KPADGetUnifiedWpadStatus_HLE, (uint32_t chan, uint32_t dst, uint32_t count),
++                         (chan, dst, count));
++
++// WPAD MotionPlus mode query (reads the control block's dev/mode on hardware). The virtual MotionPlus switches
++// instantly to whatever mode KPADEnableMpls asked for.
++extern "C" uint32_t WPADGetMplsStatus_HLE(uint32_t chan) {
++    if (!VirtualRemoteActive(chan)) return 0;
++    try {
++        return RequestedMplsMode(chan);
++    } catch (const Memory::AccessViolation&) {
++        return 0;
++    }
++}
++PPC_NATIVE_OVERRIDE(800242E0, WPADGetMplsStatus_HLE, uint32_t, (uint32_t chan), (chan));
++
++// WPADIsDpdEnabled: the HLE'd WPADInit never builds control blocks for the translated getter to read.
++extern "C" uint32_t WPADIsDpdEnabled_HLE(uint32_t chan) { return VirtualRemoteActive(chan) ? 1u : 0u; }
++PPC_NATIVE_OVERRIDE(80022F90, WPADIsDpdEnabled_HLE, uint32_t, (uint32_t chan), (chan));
+diff -ruN a/src/settings_overlay.cpp b/src/settings_overlay.cpp
+--- a/src/settings_overlay.cpp	2026-09-30 20:01:50.152549622 -0400
++++ b/src/settings_overlay.cpp	2026-09-30 20:01:50.165072406 -0400
+@@ -1,6 +1,7 @@
+ #include "settings_overlay.h"
+ #include "audio_backend.h"
+ #include "aurora_events.h"
++#include "resort_wiimote.h"
+ #include "controller_button_names.h"
+ #include "controller_mapping_wizard.h"
+ #include "input_bindings.h"
+@@ -1348,8 +1349,10 @@
+ // Runs on the thread that pumps SDL events (the same one that calls Draw), so
+ // the SDL cursor calls are safe here.
+ void UpdateCursorAutoHide() {
++    // Resortcompiled: while the mouse is the Wii Remote pointer the OS cursor stays hidden over the game.
+     const bool shouldHide =
+-        !g_topBarVisible && Clock::now() - g_lastMouseActivity >= kCursorAutoHideDelay;
++        (!g_topBarVisible && Clock::now() - g_lastMouseActivity >= kCursorAutoHideDelay) ||
++        ResortWiimote::CursorShouldHide();
+     if (shouldHide == g_cursorHidden) {
+         return;
+     }
+@@ -1425,6 +1428,7 @@
+             continue;
+         }
+         controller_mapping_wizard::HandleSdlEvent(ev->sdl);
++        ResortWiimote::HandleSdlEvent(ev->sdl);
+         if (g_rebind.active && (IsToggleKey(ev->sdl, SDL_SCANCODE_BACKSPACE) ||
+                                 IsToggleKey(ev->sdl, SDL_SCANCODE_DELETE))) {
+             CompleteRebind(g_rebind.kind == RebindKind::Controller ? PAD_NATIVE_BUTTON_DISABLED

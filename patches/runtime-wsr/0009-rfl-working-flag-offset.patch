@@ -1,0 +1,17 @@
+diff -ruN a/src/hle/os/os_alarm.cpp b/src/hle/os/os_alarm.cpp
+--- a/src/hle/os/os_alarm.cpp	2026-09-30 19:04:04.068588160 -0400
++++ b/src/hle/os/os_alarm.cpp	2026-09-30 19:04:04.077956886 -0400
+@@ -459,8 +459,12 @@
+     DecrementSchedulerDisableCount();
+ 
+     // Now return the actual "working" status
++    // Resortcompiled: WSR links an older RFL (Nov 2008) whose manager keeps the flag at +0x1B20
++    // (RFLiIsWorking @ 0x800FF564: lwz r3,-0x3A78(r13); lwz r3,0x1B20(r3)); MKW's is at +0x1B34. Reading the
++    // MKW offset returned an unrelated non-zero field, so RFLWaitAsync spun forever on a task thread.
++    // The manager pointer lives at r13-0x3A78 = 0x806F4D48 in both games.
+     constexpr uint32_t kRflManagerPtrAddr = 0x806F4D48u;
+-    constexpr uint32_t kWorkingFlagOffset = 0x1b34u;
++    constexpr uint32_t kWorkingFlagOffset = 0x1b20u;
+ 
+     try {
+         const uint32_t managerBase = ::Memory::Read32(kRflManagerPtrAddr);

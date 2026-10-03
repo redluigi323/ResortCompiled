@@ -1,0 +1,61 @@
+--- a/src/hle/gx/gx_fifo.cpp
++++ b/src/hle/gx/gx_fifo.cpp
+@@ -488,6 +488,13 @@
+         if (IsDrawOpcode(opcode)) {
+             if (g_hleGxState.fifoByteCount < 3) break;
+             const uint16_t vtxCount = ReadBE16(data + 1);
++            // Consume the entire empty primitive now, including when its
++            // header arrived across multiple MMIO writes or inside a burst.
++            // There are no vertices, so the next byte is another command.
++            if (vtxCount == 0) {
++                if (!consumeBytes(3, sink)) break;
++                continue;
++            }
+             const GXVtxFmt vtxFmt = static_cast<GXVtxFmt>(cmd & GX_VAT_MASK_CMD);
+             const GXPrimitive prim = OpcodeToGXPrimitive(cmd);
+             uint32_t rawVertexSize = 0;
+--- a/src/hle/gx/gx_vertex.cpp
++++ b/src/hle/gx/gx_vertex.cpp
+@@ -283,7 +283,9 @@
+     ServiceDeferredTimingDuringGxWork();
+     ApplyAuroraVtxStateForBegin(static_cast<GXVtxFmt>(vf));
+     g_hleGxState.currentVtxFmt=(GXVtxFmt)vf; g_hleGxState.currentPrim=(GXPrimitive)t;
+-    g_hleGxState.vertsRemaining=nv; g_hleGxState.inBegin=true; g_hleGxState.auroraBeginCalled=false;
++    // A zero-count primitive has no payload. Waiting for a first vertex
++    // here would reinterpret every later command as vertex bytes.
++    g_hleGxState.vertsRemaining=nv; g_hleGxState.inBegin=(nv != 0); g_hleGxState.auroraBeginCalled=false;
+     g_hleGxState.fifoReadOffset = 0;
+     g_hleGxState.fifoByteCount=0; g_hleGxState.ResetVertex();
+ }
+--- a/tests/resort_gx_display_list_tests.cpp
++++ b/tests/resort_gx_display_list_tests.cpp
+@@ -22,7 +22,21 @@
+     const auto write = [](uint32_t addr, const std::vector<unsigned char>& bytes) {
+         for (unsigned i = 0; i < bytes.size(); ++i) Memory::Write8(addr + i, bytes[i]);
+     };
++    // Empty draws are legal and have no vertex payload. A subsequent FIFO
++    // command must not be interpreted as the first vertex of an endless draw.
++    GX__Begin_800357d0(GX_LINES, GX_VTXFMT0, 0);
++    require(!g_hleGxState.inBegin, "empty GXBegin leaves parser at command boundary");
++    GX_HLE_FIFO_Write8(GX_LINES);
++    GX_HLE_FIFO_Write16(0);
++    require(!g_hleGxState.inBegin, "empty raw draw leaves parser at command boundary");
+     const std::vector<unsigned char> cp{8,0x50,0,0,0x14,0, 8,0x60,0,0,0,2};
++    std::vector<unsigned char> burst{GX_LINES, 0, 0};
++    burst.insert(burst.end(), cp.begin(), cp.end());
++    GX_HLE_FIFO_WriteBurst(burst.data(), burst.size());
++    require(!g_hleGxState.inBegin && g_hleGxState.fifoByteCount == 0 &&
++            g_hleGxState.vtxDesc[GX_VA_POS] == GX_INDEX8 &&
++            g_hleGxState.vtxDesc[GX_VA_TEX0] == GX_INDEX8,
++            "commands immediately following an empty draw remain commands");
+     write(list, cp);
+     GX__CallDisplayList_80039910(list, cp.size());
+     require(g_hleGxState.vtxDesc[GX_VA_POS] == GX_INDEX8 &&
+@@ -67,6 +81,6 @@
+     GXGetVtxAttrFmt(GX_VTXFMT1,GX_VA_POS,&cnt,&type,&frac);
+     require(cnt == GX_POS_XYZ && type == GX_F32 && frac == 0,
+             "mixed-format list restores every VAT row independently");
+-    std::puts("PASS: register state, nested matrices, rewritten children, and vertex-format restoration");
++    std::puts("PASS: empty draws, following FIFO commands, register state, nested matrices, and vertex formats");
+     return 0;
+ }

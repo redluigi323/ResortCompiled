@@ -1,0 +1,694 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -64,6 +64,7 @@
+ #include "hle_stubs.h"
+ #include "runtime_config.h"
+ #include "netplay/input_tape.h"
++#include "netplay/live.h"
+ #include "runtime_log.h"
+ #include "runtime_product.h"
+ #include "recomp_mod_loader.h"
+@@ -1340,6 +1341,7 @@
+         }
+         RuntimeConfigFile::LogLoadedConfig();
+         Riisorted::Netplay::InputTape::InitializeFromEnvironment();
++        Riisorted::Netplay::Live::InitializeFromEnvironment();
+         if (RuntimeConfigFile::DiscordPresenceEnabled()) {
+             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
+         }
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -34,7 +34,9 @@
+ #include "guest_interrupt_context.h"
+ #include "resort_motion.h"
+ #include "netplay/input_tape.h"
++#include "netplay/live.h"
+ #include "aurora_events.h"
++#include "guest_clock.h"
+ extern "C" int g_gxFrameCount;
+ extern "C" void func_800CFCB0(CpuContext*);
+ extern "C" void func_800CE180(CpuContext*);
+@@ -228,14 +230,27 @@
+ 
+ };
+ 
+-Remote g_remote;
++Remote g_local;
++std::array<Remote, 2> g_onlineRemotes;
++Remote* g_currentRemote = &g_local;
++Remote& CurrentRemote() { return *g_currentRemote; }
++struct RemoteScope {
++    Remote* previous;
++    explicit RemoteScope(Remote& remote) : previous(g_currentRemote) { g_currentRemote = &remote; }
++    ~RemoteScope() { g_currentRemote = previous; }
++};
++namespace Online = Riisorted::Netplay::Live;
++int g_onlineFrame = -1;
++uint64_t g_onlineSequence = 0;
++uint64_t g_previousOnlineSolverHash = 14695981039346656037ull;
++
+ 
+ namespace Tape = Riisorted::Netplay::InputTape;
+ Riisorted::Netplay::MotionBatch g_capture;
+ uint64_t g_solverHash = 14695981039346656037ull;
+ 
+ void AccumulateSolverResult(const Sample& sample) {
+-    if (!Tape::Recording() && !Tape::Replaying()) return;
++    if (!Tape::Recording() && !Tape::Replaying() && !Online::Active()) return;
+     const auto add = [](uint8_t byte) { g_solverHash = (g_solverHash ^ byte) * 1099511628211ull; };
+     add(sample.sdkMpls ? 1 : 0);
+     for (uint32_t word : sample.mpls)
+@@ -243,7 +258,7 @@
+ }
+ 
+ void CaptureMappedSample(const Sample& s) {
+-    if (!Tape::Recording()) return;
++    if (!Tape::Recording() && !Online::Active()) return;
+     if (g_capture.samples.size() == Riisorted::Netplay::kMaxMotionSamples)
+         throw std::runtime_error("Motion capture backlog exceeds the bounded sample window");
+     Riisorted::Netplay::MotionSample input;
+@@ -282,16 +297,17 @@
+ void LoadConventions() {
+     if (const char* s = std::getenv("RESORT_MPLS_SIGNS")) {
+         double a = 1, b = 1, c = 1;
+-        if (std::sscanf(s, "%lf,%lf,%lf", &a, &b, &c) == 3) g_remote.conv.gyro[0] = a, g_remote.conv.gyro[1] = b, g_remote.conv.gyro[2] = c;
+-    }
+-    if (const char* s = std::getenv("RESORT_MPLS_DIRSIGN")) g_remote.conv.dir = std::atof(s) < 0 ? -1 : 1;
++        if (std::sscanf(s, "%lf,%lf,%lf", &a, &b, &c) == 3) CurrentRemote().conv.gyro[0] = a, CurrentRemote().conv.gyro[1] = b, CurrentRemote().conv.gyro[2] = c;
++    }
++    if (const char* s = std::getenv("RESORT_MPLS_DIRSIGN")) CurrentRemote().conv.dir = std::atof(s) < 0 ? -1 : 1;
+ }
+ 
+ void Announce() {
+-    if (g_remote.announced) return;
+-    g_remote.announced = true;
++    RemoteScope local(g_local);
++    if (CurrentRemote().announced) return;
++    CurrentRemote().announced = true;
+     LoadConventions();
+-    g_remote.log = std::getenv("RESORT_WIIMOTE_LOG") != nullptr;
++    CurrentRemote().log = std::getenv("RESORT_WIIMOTE_LOG") != nullptr;
+     std::fprintf(stderr,
+                  "[wiimote] virtual Wii Remote + MotionPlus on channel 0 (keyboard/mouse or DualSense)\n"
+                  "[wiimote]   pointer: mouse | A: left click / Z | B: right click / X | 1 / 2: 1 / 2\n"
+@@ -309,6 +325,7 @@
+ }
+ 
+ bool VirtualRemoteActive(uint32_t chan) {
++    if (Online::Active()) return chan < 2;
+     if (Tape::Replaying()) return chan == 0;
+     if (chan == 0 && Tape::Recording() && WiiRemoteInput::IsRemoteChannel(0))
+         throw std::runtime_error("Motion recording currently supports the virtual remote only");
+@@ -341,34 +358,34 @@
+     in.focused = in.window != nullptr && !InputBindings::InputBlocked();
+     SDL_Gamepad* pad = DualSenseGamepad();
+     const SDL_JoystickID padId = pad ? SDL_GetGamepadID(pad) : 0;
+-    if (padId != g_remote.activeGamepad) {
+-        g_remote.activeGamepad = padId;
+-        g_remote.yaw = g_remote.pitch = g_remote.roll = 0;
+-        g_remote.prevR = Mat3{};
+-        g_remote.prevGyro = {};
+-        g_remote.angle = {};
+-        g_remote.easeLeft = 0;
+-        g_remote.tilting = false;
+-        g_remote.wheelSteps = 0;
+-        g_remote.sensors.clear();
+-        g_remote.sensorTime = 0;
+-        g_remote.binTime = 0;
+-        g_remote.binGyro = {};
+-        g_remote.pointerPose = {};
+-        g_remote.bias = {};
+-        g_remote.recenterHeld = false;
++    if (padId != CurrentRemote().activeGamepad) {
++        CurrentRemote().activeGamepad = padId;
++        CurrentRemote().yaw = CurrentRemote().pitch = CurrentRemote().roll = 0;
++        CurrentRemote().prevR = Mat3{};
++        CurrentRemote().prevGyro = {};
++        CurrentRemote().angle = {};
++        CurrentRemote().easeLeft = 0;
++        CurrentRemote().tilting = false;
++        CurrentRemote().wheelSteps = 0;
++        CurrentRemote().sensors.clear();
++        CurrentRemote().sensorTime = 0;
++        CurrentRemote().binTime = 0;
++        CurrentRemote().binGyro = {};
++        CurrentRemote().pointerPose = {};
++        CurrentRemote().bias = {};
++        CurrentRemote().recenterHeld = false;
+         if (in.window) SDL_SetWindowRelativeMouseMode(in.window, false);
+     }
+     if (pad && !in.focused) {
+         in.controller=true;
+-        g_remote.sensors.clear();g_remote.sensorTime=0;
+-        g_remote.binTime=0;g_remote.binGyro={};
++        CurrentRemote().sensors.clear();CurrentRemote().sensorTime=0;
++        CurrentRemote().binTime=0;CurrentRemote().binGyro={};
+         return in;
+     }
+     if (pad && in.focused) {
+         in.controller = true;
+-        if (g_remote.sensorEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true)) {
+-            g_remote.sensorEnabledFor = padId;
++        if (CurrentRemote().sensorEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true)) {
++            CurrentRemote().sensorEnabledFor = padId;
+         }
+         float gyro[3]{};
+         if (SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO) &&
+@@ -379,8 +396,8 @@
+             in.gyro = {deadzone(gyro[0]), deadzone(gyro[1]), deadzone(gyro[2])};
+         }
+         if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+-            if (g_remote.accelEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
+-                g_remote.accelEnabledFor = padId;
++            if (CurrentRemote().accelEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
++                CurrentRemote().accelEnabledFor = padId;
+             }
+             float acc[3]{};
+             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, acc, 3) &&
+@@ -433,13 +450,13 @@
+ }
+ 
+ uint32_t StepController(const HostInput& in);
+-void ProcessMotionPlus(Sample& s);
++void ProcessMotionPlus(Sample& s, uint32_t channel = 0);
+ 
+ // ------------------------------------------------------------------------------------------------ simulation
+ // Advances the remote by one frame of host input and returns how many 200 Hz samples to emit.
+ uint32_t StepLive(uint32_t maxSamples) {
+-    Remote& r = g_remote;
+-    const auto now = std::chrono::steady_clock::now();
++    Remote& r = CurrentRemote();
++    const auto now = GuestClock::SchedulingNow();
+     double dt = r.lastRead.time_since_epoch().count() == 0 ? 1.0 / 60.0
+                                                            : std::chrono::duration<double>(now - r.lastRead).count();
+     r.lastRead = now;
+@@ -537,7 +554,7 @@
+         s.angle = r.angle;
+         s.dt = sdt;
+         CaptureMappedSample(s);
+-        if (RequestedMplsMode(0)) ProcessMotionPlus(s);
++        if (!Online::Active() && RequestedMplsMode(0)) ProcessMotionPlus(s);
+         AccumulateSolverResult(s);
+         r.prevR = s.R;
+         r.prevGyro = s.gyro;
+@@ -566,7 +583,7 @@
+ }
+ 
+ void WriteStatus(uint32_t a, const Sample& s, const Sample* older, bool mpls, uint32_t& prevHold) {
+-    Remote& r = g_remote;
++    Remote& r = CurrentRemote();
+     Zero(a, guest::kStatusSize);
+     Memory::Write32(a + guest::kHold, s.hold);
+     Memory::Write32(a + guest::kTrig, s.hold & ~prevHold);
+@@ -655,12 +672,14 @@
+ 
+ // Run WSR's MotionPlus solver once per new sensor sample. Its work area is
+ // also used by the game's KPADResetMpls / direction and calibration functions.
+-void ProcessMotionPlus(Sample& s) {
++void ProcessMotionPlus(Sample& s, uint32_t channel) {
+     GuestInterruptCallbackContext call;
+     CpuContext* ctx=call.get();
+     if(!Memory::Contains(ctx->gpr[13]-15184,4))return;
+-    const uint32_t work=Memory::Read32(ctx->gpr[13]-15184);
+-    if(!work || !Memory::Contains(work,3512) || !Memory::Contains(ctx->gpr[1]-0x1000,0x1000))return;
++    const uint32_t base=Memory::Read32(ctx->gpr[13]-15184);
++    if (!base || channel >= 4) return;
++    const uint32_t work=base + channel * 3504u;
++    if(!Memory::Contains(work,3504) || !Memory::Contains(ctx->gpr[1]-0x1000,0x1000))return;
+     const uint32_t scratch=ctx->gpr[1]-0x300;
+     ctx->gpr[1]-=0x400;
+     WriteRaw(scratch,s,true);
+@@ -674,7 +693,7 @@
+     Memory::Write32(work+3488,scratch);
+     Memory::Write32(work+3492,scratch);
+     Memory::Write32(work+3496,0);
+-    ctx->gpr[3]=0;ctx->gpr[4]=scratch+0xc0;
++    ctx->gpr[3]=channel;ctx->gpr[4]=scratch+0xc0;
+     ctx->gpr[5]=2;ctx->gpr[6]=1;ctx->gpr[7]=scratch+0x40;
+     ctx->fpr[1].d=s.dt;
+     func_800CFCB0(ctx);
+@@ -684,13 +703,15 @@
+ }
+ 
+ uint32_t StepController(const HostInput& in) {
+-    Remote& r=g_remote;
++    Remote& r=CurrentRemote();
+     if(in.recenter && !r.recenterHeld) {
+-        if (Tape::Recording()) g_capture.recenter = true;
++        if (Tape::Recording() || Online::Active()) g_capture.recenter = true;
+         r.pointerPose={};
+-        GuestInterruptCallbackContext call;
+-        call.get()->gpr[3]=0;
+-        func_800CE180(call.get());
++        if (!Online::Active()) {
++            GuestInterruptCallbackContext call;
++            call.get()->gpr[3]=0;
++            func_800CE180(call.get());
++        }
+     }
+     r.recenterHeld=in.recenter;
+     std::deque<Sample> generated;
+@@ -710,7 +731,7 @@
+         s.roll=std::atan2(s.R.m[0][1],s.R.m[1][1]);
+         r.angle=r.angle+gyro*(dt/kMplsUnitRadPerSec);s.angle=r.angle;
+         CaptureMappedSample(s);
+-        if(RequestedMplsMode(0))ProcessMotionPlus(s);
++        if(!Online::Active() && RequestedMplsMode(0))ProcessMotionPlus(s);
+         AccumulateSolverResult(s);
+         generated.push_back(s);
+         if(generated.size()>16)generated.pop_front();
+@@ -765,15 +786,15 @@
+             history.push_back(s);
+             if (history.size() > 16) history.pop_front();
+         }
+-        g_remote.recentCount = static_cast<uint32_t>(history.size());
+-        for (uint32_t i = 0; i < g_remote.recentCount; ++i)
+-            g_remote.recent[i] = history[history.size() - 1 - i];
++        CurrentRemote().recentCount = static_cast<uint32_t>(history.size());
++        for (uint32_t i = 0; i < CurrentRemote().recentCount; ++i)
++            CurrentRemote().recent[i] = history[history.size() - 1 - i];
+         Tape::ObserveSolverResult(batch.sequence, g_solverHash);
+-        return g_remote.recentCount;
++        return CurrentRemote().recentCount;
+     }
+     if (Tape::Recording()) {
+         g_capture = {};
+-        g_capture.sequence = g_remote.batch;
++        g_capture.sequence = CurrentRemote().batch;
+         g_capture.interval = static_cast<uint64_t>(g_gxFrameCount);
+         g_capture.motionPlusMode = RequestedMplsMode(0);
+     }
+@@ -783,6 +804,53 @@
+         Tape::ObserveSolverResult(g_capture.sequence, g_solverHash);
+     }
+     return count;
++}
++
++// Exchange once for both channels even when the game reads channel 1 first.
++void EnsureOnlineFrame() {
++    if (!Online::Active() || g_onlineFrame == g_gxFrameCount) return;
++    Announce();
++    g_capture = {};
++    g_capture.sequence = g_onlineSequence;
++    g_capture.interval = static_cast<uint64_t>(g_gxFrameCount);
++    g_capture.channel = Online::LocalChannel();
++    const std::array<uint8_t, 2> modes{RequestedMplsMode(0), RequestedMplsMode(1)};
++    g_capture.motionPlusMode = modes[g_capture.channel];
++    {
++        RemoteScope local(g_local);
++        StepLive(16);
++    }
++    const auto agreed = Online::Exchange(g_capture, modes, g_previousOnlineSolverHash);
++    g_solverHash = 14695981039346656037ull;
++    for (uint32_t channel = 0; channel < 2; ++channel) {
++        Remote& remote = g_onlineRemotes[channel];
++        RemoteScope scope(remote);
++        remote.conv = g_local.conv;
++        const auto& batch = agreed.players[channel];
++        if (batch.motionPlusMode != modes[channel])
++            throw std::runtime_error("Online MotionPlus mode disagreement");
++        if (batch.recenter) {
++            GuestInterruptCallbackContext call;
++            call.get()->gpr[3] = channel;
++            func_800CE180(call.get());
++        }
++        std::deque<Sample> history;
++        for (const auto& input : batch.samples) {
++            Sample sample = RestoreMappedSample(input);
++            if (modes[channel]) ProcessMotionPlus(sample, channel);
++            AccumulateSolverResult(sample);
++            history.push_back(sample);
++            if (history.size() > 16) history.pop_front();
++        }
++        remote.recentCount = static_cast<uint32_t>(history.size());
++        for (uint32_t i = 0; i < remote.recentCount; ++i)
++            remote.recent[i] = history[history.size() - 1 - i];
++        remote.stepFrame = g_gxFrameCount;
++        ++remote.batch;
++    }
++    g_previousOnlineSolverHash = g_solverHash;
++    g_onlineFrame = g_gxFrameCount;
++    ++g_onlineSequence;
+ }
+ 
+ // ------------------------------------------------------------------------------------------------ public hooks
+@@ -802,28 +870,28 @@
+ 
+ void HandleSdlEvent(const SDL_Event& ev) {
+     if (Tape::Replaying()) return;
+-    if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && ev.gsensor.which == g_remote.activeGamepad &&
++    if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && ev.gsensor.which == g_local.activeGamepad &&
+         !InputBindings::InputBlocked()) {
+         const auto& e = ev.gsensor;
+         const Vec3 data{e.data[0],e.data[1],e.data[2]};
+         if (std::isfinite(data.x) && std::isfinite(data.y) && std::isfinite(data.z)) {
+             if(e.sensor == SDL_SENSOR_ACCEL && Len(data)<60) {
+-                g_remote.sensorAcc = ResortMotion::kpadAccel(data);
++                g_local.sensorAcc = ResortMotion::kpadAccel(data);
+                 // SDL's HIDAPI reports gyro before accel at the same device timestamp.
+-                if(!g_remote.sensors.empty() && g_remote.sensors.back().time==e.sensor_timestamp)
+-                    g_remote.sensors.back().acc=g_remote.sensorAcc;
++                if(!g_local.sensors.empty() && g_local.sensors.back().time==e.sensor_timestamp)
++                    g_local.sensors.back().acc=g_local.sensorAcc;
+             } else if(e.sensor == SDL_SENSOR_GYRO && Len(data)<40) {
+-                if(g_remote.sensors.size()==512)g_remote.sensors.pop_front();
+-                g_remote.sensors.push_back({e.sensor_timestamp,ResortMotion::bodyGyro(data),g_remote.sensorAcc});
++                if(g_local.sensors.size()==512)g_local.sensors.pop_front();
++                g_local.sensors.push_back({e.sensor_timestamp,ResortMotion::bodyGyro(data),g_local.sensorAcc});
+             }
+         }
+     }
+     if (ev.type == SDL_EVENT_MOUSE_WHEEL && !DualSenseGamepad() && !InputBindings::InputBlocked()) {
+         const float y = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev.wheel.y : ev.wheel.y;
+-        g_remote.wheelSteps += y;
+-    }
+-    if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST && g_remote.tilting) {
+-        g_remote.tilting = false;
++        g_local.wheelSteps += y;
++    }
++    if (ev.type == SDL_EVENT_WINDOW_FOCUS_LOST && g_local.tilting) {
++        g_local.tilting = false;
+         if (SDL_Window* w = SDL_GetWindowFromID(ev.window.windowID)) SDL_SetWindowRelativeMouseMode(w, false);
+     }
+ }
+@@ -889,6 +957,7 @@
+ 
+ // KPADReadEx(chan, KPADStatus* buf, u32 len, s32* err, BOOL keepLastOnNoData) -> number of samples
+ extern "C" int32_t KPADReadEx_HLE(uint32_t chan, uint32_t buf, uint32_t len, uint32_t errPtr, uint32_t keepLast) {
++    RemoteScope remote(Online::Active() && chan < 2 ? g_onlineRemotes[chan] : g_local);
+     (void)keepLast;
+     int32_t err = guest::kKpadErrNone;
+     int32_t written = 0;
+@@ -906,33 +975,34 @@
+             // Several readers poll KPAD every frame (EGG::CoreController at 0x801C4728 and the game's own
+             // controller at 0x802412F8, each with its own buffer). Advance the remote once per frame and hand every
+             // reader the same samples; button edges are tracked per reader buffer so each one sees the press.
+-            if (g_remote.recentCount == 0 || g_remote.stepFrame != g_gxFrameCount) {
++            if (Online::Active()) EnsureOnlineFrame();
++            else if (CurrentRemote().recentCount == 0 || CurrentRemote().stepFrame != g_gxFrameCount) {
+                 Step(16);
+-                g_remote.stepFrame = g_gxFrameCount;
+-                ++g_remote.batch;
+-            }
+-            if (g_remote.readerBatch[buf] == g_remote.batch) {
++                CurrentRemote().stepFrame = g_gxFrameCount;
++                ++CurrentRemote().batch;
++            }
++            if (CurrentRemote().readerBatch[buf] == CurrentRemote().batch) {
+                 if (errPtr) Memory::Write32(errPtr, static_cast<uint32_t>(-1));
+                 return 0;
+             }
+-            g_remote.readerBatch[buf] = g_remote.batch;
+-            const uint32_t n = std::min<uint32_t>(std::min<uint32_t>(len, 16), g_remote.recentCount);
++            CurrentRemote().readerBatch[buf] = CurrentRemote().batch;
++            const uint32_t n = std::min<uint32_t>(std::min<uint32_t>(len, 16), CurrentRemote().recentCount);
+             // Buttons are sampled once per host frame, so every sample of this read has the same hold. The game
+             // (0x80241670) takes hold/trig/release from status[0] only, so the edge for this frame goes on the
+             // newest sample; the older ones carry hold with no edges (no double presses for code that ORs them).
+-            uint32_t& readerPrevHold = g_remote.prevHoldByBuffer[buf];
++            uint32_t& readerPrevHold = CurrentRemote().prevHoldByBuffer[buf];
+             for (int32_t i = static_cast<int32_t>(n) - 1; i >= 0; --i) {
+-                const Sample* older = (i + 1 < static_cast<int32_t>(n)) ? &g_remote.recent[i + 1] : nullptr;
+-                uint32_t edgeBase = i == 0 ? readerPrevHold : g_remote.recent[i].hold;
+-                WriteStatus(buf + static_cast<uint32_t>(i) * guest::kStatusSize, g_remote.recent[i], older, mpls,
++                const Sample* older = (i + 1 < static_cast<int32_t>(n)) ? &CurrentRemote().recent[i + 1] : nullptr;
++                uint32_t edgeBase = i == 0 ? readerPrevHold : CurrentRemote().recent[i].hold;
++                WriteStatus(buf + static_cast<uint32_t>(i) * guest::kStatusSize, CurrentRemote().recent[i], older, mpls,
+                             edgeBase);
+             }
+-            if (g_remote.log && g_remote.recent[0].hold != readerPrevHold) {
++            if (CurrentRemote().log && CurrentRemote().recent[0].hold != readerPrevHold) {
+                 std::fprintf(stderr, "[wiimote] read buf=0x%08X n=%u hold 0x%04X -> 0x%04X mpls=%d ptr=(%.2f,%.2f)%s\n",
+-                             buf, n, readerPrevHold, g_remote.recent[0].hold, mpls ? 1 : 0, g_remote.recent[0].posX,
+-                             g_remote.recent[0].posY, g_remote.recent[0].pointerValid ? "" : " offscreen");
+-            }
+-            readerPrevHold = g_remote.recent[0].hold;
++                             buf, n, readerPrevHold, CurrentRemote().recent[0].hold, mpls ? 1 : 0, CurrentRemote().recent[0].posX,
++                             CurrentRemote().recent[0].posY, CurrentRemote().recent[0].pointerValid ? "" : " offscreen");
++            }
++            readerPrevHold = CurrentRemote().recent[0].hold;
+             // KPAD keeps a copy of the newest status at the start of its channel state.
+             const uint32_t state = guest::kKpadStateBase + chan * guest::kKpadStateStride;
+             for (uint32_t o = 0; o < guest::kStatusSize; o += 4) Memory::Write32(state + o, Memory::Read32(buf + o));
+@@ -950,6 +1020,8 @@
+ 
+ // KPAD raw sample copy (KPADGetUnifiedWpadStatus): count 0x40-byte samples, newest first.
+ extern "C" void KPADGetUnifiedWpadStatus_HLE(uint32_t chan, uint32_t dst, uint32_t count) {
++    RemoteScope remote(Online::Active() && chan < 2 ? g_onlineRemotes[chan] : g_local);
++    if (Online::Active() && chan < 2) EnsureOnlineFrame();
+     try {
+         count = std::min<uint32_t>(count, 16);
+         const bool active = VirtualRemoteActive(chan);
+@@ -962,8 +1034,8 @@
+                 Memory::Write8(a + guest::kRawErr, 0xFF);  // WPAD_ERR_NO_CONTROLLER
+                 continue;
+             }
+-            const uint32_t idx = std::min(i, g_remote.recentCount ? g_remote.recentCount - 1 : 0);
+-            WriteRaw(a, g_remote.recent[idx], mpls);
++            const uint32_t idx = std::min(i, CurrentRemote().recentCount ? CurrentRemote().recentCount - 1 : 0);
++            WriteRaw(a, CurrentRemote().recent[idx], mpls);
+         }
+     } catch (const Memory::AccessViolation&) {
+     }
+--- a/src/guest_clock.cpp
++++ b/src/guest_clock.cpp
+@@ -1,10 +1,15 @@
+ #include "guest_clock.h"
+ #include "timebase_contract.h"
+ #include <chrono>
++#include <mutex>
+ 
+ namespace GuestClock {
+ namespace {
+ const auto start = std::chrono::steady_clock::now();
++std::chrono::steady_clock::duration paused{};
++std::chrono::steady_clock::time_point pauseStart{};
++unsigned depth = 0;
++std::mutex clockMutex;
+ }
+ uint64_t ReadTimeBase() noexcept {
+     const auto elapsed = SchedulingNow() - start;
+@@ -12,6 +17,20 @@
+     return TimeBaseContract::NanosecondsToTicks(static_cast<uint64_t>(nanos));
+ }
+ std::chrono::steady_clock::time_point SchedulingNow() noexcept {
+-    return std::chrono::steady_clock::now();
++    std::lock_guard<std::mutex> lock(clockMutex);
++    return (depth ? pauseStart : std::chrono::steady_clock::now()) - paused;
++}
++std::chrono::steady_clock::time_point ToHostTime(std::chrono::steady_clock::time_point guest) noexcept {
++    std::lock_guard<std::mutex> lock(clockMutex);
++    return guest + paused + (depth ? std::chrono::steady_clock::now() - pauseStart :
++                                    std::chrono::steady_clock::duration{});
++}
++Pause::Pause() noexcept {
++    std::lock_guard<std::mutex> lock(clockMutex);
++    if (depth++ == 0) pauseStart = std::chrono::steady_clock::now();
++}
++Pause::~Pause() {
++    std::lock_guard<std::mutex> lock(clockMutex);
++    if (--depth == 0) paused += std::chrono::steady_clock::now() - pauseStart;
+ }
+ }
+--- a/include/guest_clock.h
++++ b/include/guest_clock.h
+@@ -10,4 +10,13 @@
+ // Guest event deadlines use this source; renderer pacing and host diagnostics
+ // continue to use steady_clock directly. Currently retains offline wall time.
+ std::chrono::steady_clock::time_point SchedulingNow() noexcept;
++std::chrono::steady_clock::time_point ToHostTime(std::chrono::steady_clock::time_point guest) noexcept;
++// Network waits do not become guest retrace/alarm/audio catch-up time.
++class Pause {
++public:
++    Pause() noexcept;
++    ~Pause();
++    Pause(const Pause&) = delete;
++    Pause& operator=(const Pause&) = delete;
++};
+ }
+--- a/src/hle/vi.cpp
++++ b/src/hle/vi.cpp
+@@ -162,6 +162,7 @@
+ 
+ void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false,
+                          std::chrono::microseconds spinWindow = 750us) {
++    deadline = GuestClock::ToHostTime(deadline);
+     const auto now = Clock::now();
+     if (now >= deadline) {
+         return;
+@@ -462,7 +463,7 @@
+         retraceDeadline = g_vi.lastRetrace + g_vi.retraceInterval;
+     }
+ 
+-    const auto now = Clock::now();
++    const auto now = GuestClock::SchedulingNow();
+     if (now >= retraceDeadline) {
+         return;
+     }
+@@ -491,7 +492,7 @@
+ void PaceToRetraceBoundary(Clock::time_point deadline) {
+     constexpr auto kServiceSlice = 1ms;
+     for (;;) {
+-        const auto now = Clock::now();
++        const auto now = GuestClock::SchedulingNow();
+         if (now >= deadline) {
+             break;
+         }
+@@ -536,7 +537,7 @@
+             retraceCount = g_vi.retraceCount;
+             baseNanos = static_cast<uint64_t>(
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                    g_vi.lastRetrace.time_since_epoch())
++                    GuestClock::ToHostTime(g_vi.lastRetrace).time_since_epoch())
+                     .count());
+             intervalNanos = static_cast<uint64_t>(
+                 std::chrono::duration_cast<std::chrono::nanoseconds>(g_vi.retraceInterval)
+@@ -925,7 +926,7 @@
+             target = g_vi.lastRetrace + interval;
+         }
+ 
+-        const auto now = Clock::now();
++        const auto now = GuestClock::SchedulingNow();
+         if (now < target) {
+             SleepPreciselyUntil(target, true);
+         }
+--- /dev/null
++++ b/include/netplay/live.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "netplay/session.h"
++
++namespace Riisorted::Netplay::Live {
++// The launcher owns internet TLS, session data and lifecycle. The native runtime
++// talks only to its authenticated loopback broker, never an unverified remote.
++void InitializeFromEnvironment();
++bool Active() noexcept;
++uint8_t LocalChannel() noexcept;
++AgreedInputs Exchange(const MotionBatch& local, const std::array<uint8_t, 2>& modes,
++                     uint64_t previousSolverHash);
++}
+--- /dev/null
++++ b/src/netplay/live.cpp
+@@ -0,0 +1,122 @@
++#include "netplay/live.h"
++#include "guest_clock.h"
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <utility>
++
++#if defined(__linux__)
++#include <arpa/inet.h>
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++namespace Riisorted::Netplay::Live {
++namespace {
++bool active = false;
++uint8_t channel = 0;
++#if defined(__linux__)
++struct Connection {
++    int fd = -1;
++    ~Connection() { if (fd >= 0) close(fd); }
++} connection;
++void Transfer(void* data, size_t size, bool write) {
++    auto* bytes = static_cast<uint8_t*>(data);
++    while (size) {
++        const auto count = write ? send(connection.fd, bytes, size, MSG_NOSIGNAL)
++                                 : recv(connection.fd, bytes, size, 0);
++        if (count <= 0) throw std::runtime_error("Online session disconnected or timed out; session saves were not committed");
++        bytes += count;
++        size -= static_cast<size_t>(count);
++    }
++}
++void Send(const std::vector<uint8_t>& bytes) {
++    uint32_t size = htonl(static_cast<uint32_t>(bytes.size()));
++    Transfer(&size, 4, true);
++    Transfer(const_cast<uint8_t*>(bytes.data()), bytes.size(), true);
++}
++std::vector<uint8_t> Receive() {
++    uint32_t size;
++    Transfer(&size, 4, false);
++    size = ntohl(size);
++    if (!size || size > 2 * kMaxMotionPacketBytes + 64)
++        throw std::runtime_error("Invalid online bridge response size");
++    std::vector<uint8_t> bytes(size);
++    Transfer(bytes.data(), bytes.size(), false);
++    if (bytes[0] == 'E') throw std::runtime_error("Online session: " + std::string(bytes.begin() + 1, bytes.end()));
++    return bytes;
++}
++uint32_t Number(const char* text, uint32_t max) {
++    if (!text || !*text) throw std::invalid_argument("Missing online bridge setting");
++    char* end = nullptr;
++    const auto value = std::strtoul(text, &end, 10);
++    if (*end || value > max) throw std::invalid_argument("Invalid online bridge setting");
++    return static_cast<uint32_t>(value);
++}
++#endif
++}
++bool Active() noexcept { return active; }
++uint8_t LocalChannel() noexcept { return channel; }
++void InitializeFromEnvironment() {
++    const char* portText = std::getenv("RESORT_NETPLAY_BRIDGE_PORT");
++    if (!portText) return;
++#if defined(__linux__)
++    if (std::getenv("RESORT_INPUT_RECORD") || std::getenv("RESORT_INPUT_REPLAY"))
++        throw std::invalid_argument("Online play cannot run together with input tape mode");
++    const uint32_t port = Number(portText, 65535);
++    if (!port) throw std::invalid_argument("Invalid online bridge port");
++    channel = static_cast<uint8_t>(Number(std::getenv("RESORT_NETPLAY_PLAYER"), 1));
++    const char* secret = std::getenv("RESORT_NETPLAY_BRIDGE_SECRET");
++    if (!secret || std::strlen(secret) != 64) throw std::invalid_argument("Invalid online bridge secret");
++    GuestClock::Pause pause;
++    connection.fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (connection.fd < 0) throw std::runtime_error("Cannot create online bridge socket");
++    const timeval timeout{20, 0};
++    const int enabled = 1;
++    setsockopt(connection.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++    setsockopt(connection.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++    setsockopt(connection.fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
++    sockaddr_in address{};
++    address.sin_family = AF_INET;
++    address.sin_port = htons(port);
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    if (connect(connection.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)))
++        throw std::runtime_error("Cannot connect to the launcher online bridge");
++    Send(std::vector<uint8_t>(secret, secret + 64));
++    if (Receive() != std::vector<uint8_t>{'R'}) throw std::runtime_error("Invalid online bridge handshake");
++    active = true;
++    std::fprintf(stderr, "RIISORTED_NETPLAY_V1: connected as Wii Remote %u; experimental replicated simulation\n", channel + 1);
++#else
++    throw std::runtime_error("This first online runtime supports Linux only");
++#endif
++}
++AgreedInputs Exchange(const MotionBatch& local, const std::array<uint8_t, 2>& modes, uint64_t hash) {
++#if defined(__linux__)
++    if (!active || local.channel != channel) throw std::logic_error("Invalid local online input assignment");
++    auto encoded = EncodeMotionBatch(local);
++    std::vector<uint8_t> request{'I', modes[0], modes[1]};
++    for (int shift = 56; shift >= 0; shift -= 8) request.push_back(uint8_t(hash >> shift));
++    request.insert(request.end(), encoded.begin(), encoded.end());
++    GuestClock::Pause pause;
++    Send(request);
++    const auto reply = Receive();
++    if (reply[0] != 'P' || reply.size() < 5) throw std::runtime_error("Invalid agreed input response");
++    const size_t first = (size_t(reply[1]) << 24) | (size_t(reply[2]) << 16) |
++                         (size_t(reply[3]) << 8) | reply[4];
++    if (first > kMaxMotionPacketBytes || first > reply.size() - 5)
++        throw std::runtime_error("Invalid agreed input lengths");
++    LockstepQueue queue(local.interval, 1);
++    queue.Submit(DecodeMotionBatch(std::vector<uint8_t>(reply.begin() + 5, reply.begin() + 5 + first)));
++    queue.Submit(DecodeMotionBatch(std::vector<uint8_t>(reply.begin() + 5 + first, reply.end())));
++    auto result = queue.Take();
++    if (!result || EncodeMotionBatch(result->players[channel]) != encoded)
++        throw std::runtime_error("Online input assignment disagrees with local input");
++    return std::move(*result);
++#else
++    throw std::runtime_error("Online runtime is unavailable on this platform");
++#endif
++}
++}

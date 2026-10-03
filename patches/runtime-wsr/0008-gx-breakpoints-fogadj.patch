@@ -1,0 +1,50 @@
+diff -ruN -U2 a/src/hle/gx/gx_fatal_stubs.cpp b/src/hle/gx/gx_fatal_stubs.cpp
+--- a/src/hle/gx/gx_fatal_stubs.cpp	2026-09-29 23:58:01.638703018 -0400
++++ b/src/hle/gx/gx_fatal_stubs.cpp	2026-09-29 23:58:01.641979330 -0400
+@@ -34,9 +34,6 @@
+ GX_FATAL_STUB(80031b10, "__GX__DefaultTlutRegionCallback_80031b10") PPC_NATIVE_OVERRIDE_VOID(80031b10, gx_stub_80031b10, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80031b40, "__GX__Shutdown_80031b40") PPC_NATIVE_OVERRIDE_VOID(80031b40, gx_stub_80031b40, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80032bb0, "GX__CPInterruptHandler_80032bb0") PPC_NATIVE_OVERRIDE_VOID(80032bb0, gx_stub_80032bb0, (CpuContext* ctx), (ctx));
+-GX_FATAL_STUB(800335d0, "GX__SetBreakPtCallback_800335d0") PPC_NATIVE_OVERRIDE_VOID(800335d0, gx_stub_800335d0, (CpuContext* ctx), (ctx));
+-GX_FATAL_STUB(80033620, "GX__EnableBreakPt_80033620") PPC_NATIVE_OVERRIDE_VOID(80033620, gx_stub_80033620, (CpuContext* ctx), (ctx));
+-GX_FATAL_STUB(800336c0, "GX__DisableBreakPt_800336c0") PPC_NATIVE_OVERRIDE_VOID(800336c0, gx_stub_800336c0, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80033790, "__GX__CleanGPFifo_80033790") PPC_NATIVE_OVERRIDE_VOID(80033790, gx_stub_80033790, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(8003395c, "GX__SetVtxDesc_switch_8003395c") PPC_NATIVE_OVERRIDE_VOID(8003395c, gx_stub_8003395c, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80033960, "GX__SetVtxDesc_caseD_0_80033960") PPC_NATIVE_OVERRIDE_VOID(80033960, gx_stub_80033960, (CpuContext* ctx), (ctx));
+@@ -222,7 +219,6 @@
+ GX_FATAL_STUB(8016f23c, "__GX__SendFlushPrim_8016f23c") PPC_NATIVE_OVERRIDE_VOID(8016f23c, gx_stub_8016f23c, (CpuContext* ctx), (ctx));
+ #endif // RESORT-UNMAPPED
+ GX_FATAL_STUB(80035b50, "__GX__SetGenMode_80035b50") PPC_NATIVE_OVERRIDE_VOID(80035b50, gx_stub_80035b50, (CpuContext* ctx), (ctx));
+-GX_FATAL_STUB(80038e80, "GX__InitFogAdjTable_80038e80") PPC_NATIVE_OVERRIDE_VOID(80038e80, gx_stub_80038e80, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80039990, "__GX__SetProjection_80039990") PPC_NATIVE_OVERRIDE_VOID(80039990, gx_stub_80039990, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80039ce0, "__GX__SetViewport_80039ce0") PPC_NATIVE_OVERRIDE_VOID(80039ce0, gx_stub_80039ce0, (CpuContext* ctx), (ctx));
+ GX_FATAL_STUB(80039F60, "__GX__SetMatrixIndex_80039F60") PPC_NATIVE_OVERRIDE_VOID(80039F60, gx_stub_80039F60, (CpuContext* ctx), (ctx));
+diff -ruN -U2 a/src/resort_gx_breakpt.cpp b/src/resort_gx_breakpt.cpp
+--- a/src/resort_gx_breakpt.cpp	1969-12-31 19:30:00.000000000 -0430
++++ b/src/resort_gx_breakpt.cpp	2026-09-29 23:58:01.644621948 -0400
+@@ -0,0 +1,25 @@
++// Resortcompiled: GX FIFO breakpoint HLE.
++#include <cstdint>
++#include <cstdio>
++
++#include "hle_stubs.h"
++#include "ppc_runtime.h"
++
++// WSR's EGG::ProcessMeter (the CPU/GPU perf meter behind EGG::CpuGpMonitor) arms a GP FIFO breakpoint at the
++// current write pointer each frame so the CP interrupt tells it when the GPU got there. Mario Kart Wii never
++// uses this, so WiiCompiled had these as fatal stubs. Aurora has no GP FIFO to break on; the breakpoint
++// simply never fires and the meter reads zero, which only affects the (hidden) debug meter.
++// GXSetBreakPtCallback itself only swaps a global and is left to the translated code.
++static bool g_loggedBreakPt = false;
++
++extern "C" void GXEnableBreakPt_HLE(uint32_t fifoPtr) {
++    if (!g_loggedBreakPt) {
++        g_loggedBreakPt = true;
++        std::fprintf(stderr, "[gx] GXEnableBreakPt(0x%08X) ignored - no GP FIFO breakpoints (EGG::ProcessMeter)\n",
++                     fifoPtr);
++    }
++}
++PPC_NATIVE_OVERRIDE_VOID(80033620, GXEnableBreakPt_HLE, (uint32_t fifoPtr), (fifoPtr));
++
++extern "C" void GXDisableBreakPt_HLE() {}
++PPC_NATIVE_OVERRIDE_VOID(800336C0, GXDisableBreakPt_HLE, (), ());

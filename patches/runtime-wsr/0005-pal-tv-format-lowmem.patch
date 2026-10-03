@@ -1,0 +1,14 @@
+diff -ru a/src/system_bridge.cpp b/src/system_bridge.cpp
+--- a/src/system_bridge.cpp	2026-09-29 22:36:16.165621321 -0400
++++ b/src/system_bridge.cpp	2026-09-29 22:36:16.185294163 -0400
+@@ -532,6 +532,10 @@
+     }
+ 
+     // Seed OS clock values used by SDK timing helpers (OSBusClock/OSClock).
++    // Resortcompiled: 0x800000CC is the console's TV format (set by the IPL: 0 NTSC, 1 PAL, 5 EURGB60).
++    // WSR's OS font code (OSGetFontEncode/OSLoadFont) reads the VI DTV register 0xCC00206E when it is 0,
++    // which has no HLE backing. A PAL console reports EURGB60 here; keeps the port at 60 Hz.
++    entries.push_back({0x800000CCu, 5u, "TV format (EURGB60)"});
+     entries.push_back({0x800000F8u, kBusClockHz, "__OSBusClock"});
+     entries.push_back({0x800000FCu, kCpuClockHz, "__OSClock"});
+     entries.push_back({0x80003140u, kIos36Version, "IOS36 version"});

@@ -1,0 +1,27 @@
+/external/
+/tools/bin/
+/work/
+/disc/*
+!/disc/README.md
+*.iso
+*.rvz
+*.wbfs
+*.wia
+*.ciso
+*.gcz
+*.dol
+*.rel
+/out/
+
+# Release launcher build products
+/launcher/payload/
+/launcher/.payload-*/
+/dist/
+/.venv-launcher/
+/launcher/__pycache__/
+**/__pycache__/
+*.pyc
+/tools/fonts/
+/.agents/
+/.codex/
+/.aws/

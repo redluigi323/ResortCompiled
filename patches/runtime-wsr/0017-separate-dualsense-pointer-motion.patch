@@ -1,0 +1,99 @@
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -264,7 +264,8 @@
+     bool controller = false;
+     uint32_t hold = 0;
+     bool tilt = false, shake = false, recenter = false;
+-    Vec3 gyro;
++    Vec3 gyro;             // SDL pad axes, retained for the established pointer mapping
++    Vec3 motionGyro;       // flat-pad axes mapped to the virtual remote
+     Vec3 acc;
+     bool accValid = false;
+     Vec3 peakAcc;
+@@ -310,7 +311,11 @@
+             // mirrored horizontally for the game's turn direction. Angular
+             // velocity is an axial vector, so its mirror signs differ from
+             // the accelerometer's below.
+-            in.gyro = {gyro[0], -gyro[2], gyro[1]};
++            const auto pointerDeadzone = [](float value) {
++                return std::fabs(value) < 0.025f ? 0.0 : static_cast<double>(value);
++            };
++            in.gyro = {pointerDeadzone(gyro[0]), pointerDeadzone(gyro[1]), pointerDeadzone(gyro[2])};
++            in.motionGyro = {gyro[0], -gyro[2], gyro[1]};
+         }
+         if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+             if (g_remote.accelEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
+@@ -391,30 +396,30 @@
+     if (bowlingScene) {
+         // Bowling's arm swing uses the opposite vertical sense to the other
+         // sports. Reflect the pitch and its accelerometer gravity component.
+-        in.gyro.x = -in.gyro.x;
++        in.motionGyro.x = -in.motionGyro.x;
+         if (in.accValid) in.acc.z = -in.acc.z;
+         if (in.peakAccValid) in.peakAcc.z = -in.peakAcc.z;
+     }
+     Mat3 controllerStart = r.controllerR;
+-    Vec3 controllerRate{};
++    Vec3 controllerRate{}, correctionRate{};
+     if (in.controller) {
+         if (in.recenter) {
+             controllerStart = r.controllerR = r.prevR = Mat3{};
+             r.prevGyro = r.angle = {};
+         }
+-        const bool quiet = in.accValid && std::fabs(Len(in.acc) - 1.0) < 0.12 && Len(in.gyro) < 0.12;
++        const bool quiet = in.accValid && std::fabs(Len(in.acc) - 1.0) < 0.12 && Len(in.motionGyro) < 0.12;
+         if (quiet) {
+             const double k = r.gyroBiasValid ? 1.0 - std::exp(-dt / 2.0) : 1.0;
+-            r.gyroBias = r.gyroBias + (in.gyro - r.gyroBias) * k;
++            r.gyroBias = r.gyroBias + (in.motionGyro - r.gyroBias) * k;
+             r.gyroBiasValid = true;
+         }
+-        controllerRate = in.gyro - r.gyroBias;
++        controllerRate = in.motionGyro - r.gyroBias;
+         if (quiet && Len(controllerRate) < 0.015) controllerRate = {};
+         // Gravity can correct tilt while the pad is still; never use it to
+         // damp a live swing. Yaw is intentionally left to the gyro/recenter.
+         if (in.accValid && Len(controllerRate) < 0.3 && std::fabs(Len(in.acc) - 1.0) < 0.12) {
+             const Vec3 expected = Apply(Transpose(controllerStart), Vec3{0, -1, 0});
+-            controllerRate = controllerRate + Cross(in.acc * (1.0 / Len(in.acc)), expected) * 1.5;
++            correctionRate = Cross(in.acc * (1.0 / Len(in.acc)), expected) * 1.5;
+         }
+     }
+ 
+@@ -425,7 +430,11 @@
+     if (in.recenter) endYaw = endPitch = endRoll = 0;
+ 
+     if (in.focused && in.controller) {
+-        // Controller rotation is integrated below in its own body frame.
++        // Keep the original DualSense pointer behavior independent of the
++        // game's MotionPlus axes. It was already working for IR aiming.
++        endPitch += in.gyro.x * dt;
++        endYaw -= in.gyro.y * dt;
++        endRoll -= in.gyro.z * dt;
+     } else if (in.focused && in.tilt) {
+         if (!r.tilting) {
+             r.tilting = true;
+@@ -483,10 +492,10 @@
+         const double yaw = startYaw + std::remainder(endYaw - startYaw, 2 * kPi) * t;
+         const double pitch = startPitch + (endPitch - startPitch) * t;
+         const double roll = startRoll + std::remainder(endRoll - startRoll, 2 * kPi) * t;
+-        s.R = in.controller ? Mul(controllerStart, RotVector(controllerRate * (sdt * (i + 1))))
++        s.R = in.controller ? Mul(controllerStart, RotVector((controllerRate + correctionRate) * (sdt * (i + 1))))
+                             : Orientation(yaw, pitch, roll);
+-        s.roll = in.controller ? std::atan2(s.R.m[1][0], s.R.m[0][0]) : roll;
+-        s.gyro = AngularVelocity(r.prevR, s.R, sdt);
++        s.roll = roll;
++        s.gyro = in.controller ? controllerRate : AngularVelocity(r.prevR, s.R, sdt);
+         r.simTime += sdt;
+ 
+         // Accelerometer: gravity direction in the remote frame, minus the motion of the tip (lever along -Z).
+@@ -509,7 +518,8 @@
+         }
+ 
+         // Pointer: where the aim ray crosses the screen plane.
+-        const Vec3 fwd = Column(s.R, 2) * -1.0;
++        const Mat3 pointerR = in.controller ? Orientation(yaw, pitch, roll) : s.R;
++        const Vec3 fwd = Column(pointerR, 2) * -1.0;
+         if (fwd.z < -0.2) {
+             const double ax = std::atan2(fwd.x, -fwd.z), ay = std::atan2(fwd.y, -fwd.z);
+             s.posX = std::tan(ax) / std::tan(kHalfFovX);

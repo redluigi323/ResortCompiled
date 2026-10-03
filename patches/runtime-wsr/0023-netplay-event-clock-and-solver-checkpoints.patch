@@ -1,0 +1,392 @@
+--- a/src/hle/os/os_sleep.cpp
++++ b/src/hle/os/os_sleep.cpp
+@@ -16,6 +16,7 @@
+ #include "ppc_runtime.h"
+ #include "fiber_manager.h"
+ #include "timebase_contract.h"
++#include "guest_clock.h"
+ #include "runtime_log.h"
+ #include "os_internal.h"
+ 
+@@ -62,10 +63,13 @@
+ 
+ void ScheduleSleepTimer(uint32_t threadPtr, uint64_t ticks)
+ {
+-    using Clock = std::chrono::steady_clock;
+-
+-    const auto duration = TimeBaseContract::TicksToDuration(ticks);
+-    const auto deadline = Clock::now() + duration;
++    // Retain the previous duration converter's immediate-expiry behavior for
++    // oversized values (including signed negative durations passed as u64).
++    constexpr uint64_t maxSleepTicks = TimeBaseContract::NanosecondsToTicks(
++        static_cast<uint64_t>(std::chrono::nanoseconds::max().count()));
++    const uint64_t delayTicks = ticks > maxSleepTicks ? 0 : ticks;
++    const auto now = GuestClock::ReadTimeBase();
++    const uint64_t deadline = delayTicks > UINT64_MAX - now ? UINT64_MAX : now + delayTicks;
+ 
+     std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+     std::erase_if(gSleepTimers, [threadPtr](const SleepTimerEntry& entry) {
+@@ -76,8 +80,6 @@
+ 
+ bool ProcessSleepTimers(CpuContext* cpu)
+ {
+-    using Clock = std::chrono::steady_clock;
+-
+     // Pop and process ONE due timer at a time, straight from the shared table. Resuming a
+     // sleeper re-enters the scheduler (OSResumeThread -> SelectThread) and can switch fibers
+     // away from this call. Timers that had already been popped into a private list would then
+@@ -89,14 +91,14 @@
+     bool processedAny = false;
+     constexpr size_t kMaxTimersPerCall = 64;
+     size_t processedCount = 0;
+-    const auto now = Clock::now();
++    const uint64_t now = GuestClock::ReadTimeBase();
+     while (processedCount < kMaxTimersPerCall) {
+         SleepTimerEntry timer{0, {}};
+         bool found = false;
+         {
+             std::lock_guard<std::mutex> lock(gSleepTimerMutex);
+             for (auto it = gSleepTimers.begin(); it != gSleepTimers.end(); ++it) {
+-                if (it->deadline <= now) {
++                if (it->deadlineTicks <= now) {
+                     timer = *it;
+                     gSleepTimers.erase(it);
+                     found = true;
+@@ -133,7 +135,8 @@
+                 }
+             }
+             if (!present) {
+-                gSleepTimers.push_back({threadPtr, now + std::chrono::milliseconds(2)});
++                constexpr uint64_t retryTicks = TimeBaseContract::kTicksPerSecond / 500;
++                gSleepTimers.push_back({threadPtr, now > UINT64_MAX - retryTicks ? UINT64_MAX : now + retryTicks});
+             }
+             continue;
+         }
+@@ -160,24 +163,27 @@
+     // race) by resuming it once that shape persists for 100ms, sampled every 50ms so no strand is
+     // missed. The atomic CAS below lets exactly one caller run the scan when ProcessSleepTimers
+     // executes on more than one host thread; the rest skip it.
+-    static std::atomic<Clock::rep> strandScanDueAt{0};
++    static std::atomic<uint64_t> strandScanDueAt{0};
+     auto strandScanClaim = strandScanDueAt.load(std::memory_order_relaxed);
+     const bool runStrandReconciler =
+-        now.time_since_epoch().count() >= strandScanClaim &&
++        now >= strandScanClaim &&
+         strandScanDueAt.compare_exchange_strong(
+             strandScanClaim,
+-            static_cast<Clock::rep>(
+-                (now + std::chrono::milliseconds(50)).time_since_epoch().count()),
++            now > UINT64_MAX - TimeBaseContract::kTicksPerSecond / 20 ? UINT64_MAX :
++                now + TimeBaseContract::kTicksPerSecond / 20,
+             std::memory_order_relaxed);
+     if (runStrandReconciler) {
+         static std::mutex strandMutex;
+-        static std::unordered_map<uint32_t, Clock::time_point> strandFirstSeen;
++        static std::unordered_map<uint32_t, uint64_t> strandFirstSeen;
+ 
+         std::vector<uint32_t> outstanding;
+         {
+             std::lock_guard<std::mutex> lock(gOutstandingParkMutex);
+             outstanding.assign(gOutstandingParks.begin(), gOutstandingParks.end());
+         }
++        // Address ordering is stable across peers; unordered_set iteration is
++        // not a valid order for guest wakeups when multiple threads need repair.
++        std::sort(outstanding.begin(), outstanding.end());
+         // Decide who to heal under the lock, but resume OUTSIDE it: the resume
+         // re-enters the scheduler and thus this function, and holding the lock
+         // across it is a guaranteed self-deadlock.
+@@ -193,7 +199,7 @@
+                     ++it;
+                 }
+             }
+-            const auto reconcileNow = Clock::now();
++            const auto reconcileNow = GuestClock::ReadTimeBase();
+             for (const uint32_t threadPtr : outstanding) {
+                 if (SleepTimerIsPending(threadPtr)) {
+                     strandFirstSeen.erase(threadPtr);
+@@ -218,7 +224,7 @@
+                     strandFirstSeen.emplace(threadPtr, reconcileNow);
+                     continue;
+                 }
+-                if (reconcileNow - seen->second < std::chrono::milliseconds(100)) {
++                if (reconcileNow - seen->second < TimeBaseContract::kTicksPerSecond / 10) {
+                     continue;
+                 }
+                 strandFirstSeen.erase(seen);
+--- a/src/hle/os/os_internal.h
++++ b/src/hle/os/os_internal.h
+@@ -87,7 +87,7 @@
+ 
+ struct SleepTimerEntry {
+     uint32_t threadPtr;
+-    std::chrono::steady_clock::time_point deadline;
++    uint64_t deadlineTicks;
+ };
+ 
+ inline bool ThreadStateIsTerminated(uint16_t state)
+--- a/src/hle/audio/audio.cpp
++++ b/src/hle/audio/audio.cpp
+@@ -1,3 +1,4 @@
++#include "guest_clock.h"
+ #include "memory.h"
+ #include "guest_interrupt_context.h"
+ #include "hle_stubs.h"
+@@ -499,9 +500,9 @@
+ int64_t ConsumeAudioPollDeltaMicros()
+ {
+     using Clock = std::chrono::steady_clock;
+-    static thread_local Clock::time_point lastPoll = Clock::now();
+-
+-    const Clock::time_point now = Clock::now();
++    static thread_local Clock::time_point lastPoll = GuestClock::SchedulingNow();
++
++    const Clock::time_point now = GuestClock::SchedulingNow();
+     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - lastPoll).count();
+     lastPoll = now;
+ 
+--- a/src/hle/vi.cpp
++++ b/src/hle/vi.cpp
+@@ -1,3 +1,4 @@
++#include "guest_clock.h"
+ #include "hle_stubs.h"
+ #include "memory.h"
+ #include "abi_bridge.h"
+@@ -100,7 +101,7 @@
+     uint32_t xfbWidth = 640;
+     uint32_t xfbHeight = 480;
+     bool fieldOdd = false;
+-    Clock::time_point lastRetrace = Clock::now();
++    Clock::time_point lastRetrace = GuestClock::SchedulingNow();
+     std::chrono::microseconds retraceInterval{16666us}; // ~60 Hz
+     bool hasValidXfb = false; // True once we've received at least one GXCopyDisp
+     uint32_t readyXfb = 0;    // XFB address from the most recent GXCopyDisp
+@@ -244,7 +245,7 @@
+     }
+     g_vi.initialized = true;
+     g_vi.retraceInterval = IntervalForFormat(g_vi.tvFormat);
+-    g_vi.lastRetrace = Clock::now();
++    g_vi.lastRetrace = GuestClock::SchedulingNow();
+     WriteGuestStateLocked();
+ }
+ 
+@@ -383,7 +384,7 @@
+ 
+     for (int catchUpCount = 0; catchUpCount < maxToProcess; ++catchUpCount) {
+         Clock::time_point target;
+-        auto now = Clock::now();
++        auto now = GuestClock::SchedulingNow();
+         {
+             std::lock_guard<std::mutex> lock(g_viMutex);
+             if (!g_vi.initialized) {
+@@ -876,7 +877,7 @@
+         interval = g_vi.retraceInterval;
+         last = g_vi.lastRetrace;
+     }
+-    const auto now = Clock::now();
++    const auto now = GuestClock::SchedulingNow();
+     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last);
+     uint32_t line = 0;
+     if (interval.count() > 0 && height > 0) {
+--- a/include/guest_clock.h
++++ b/include/guest_clock.h
+@@ -1,9 +1,13 @@
+ #pragma once
+ #include <cstdint>
++#include <chrono>
+ 
+ // Central entry point for guest-visible time. Offline time retains its real-time
+ // behavior. Session clock activation is intentionally unavailable until all VI,
+ // alarm, sleep and audio event sources obey deterministic scheduling.
+ namespace GuestClock {
+ uint64_t ReadTimeBase() noexcept;
++// Guest event deadlines use this source; renderer pacing and host diagnostics
++// continue to use steady_clock directly. Currently retains offline wall time.
++std::chrono::steady_clock::time_point SchedulingNow() noexcept;
+ }
+--- a/src/guest_clock.cpp
++++ b/src/guest_clock.cpp
+@@ -7,8 +7,11 @@
+ const auto start = std::chrono::steady_clock::now();
+ }
+ uint64_t ReadTimeBase() noexcept {
+-    const auto elapsed = std::chrono::steady_clock::now() - start;
++    const auto elapsed = SchedulingNow() - start;
+     const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+     return TimeBaseContract::NanosecondsToTicks(static_cast<uint64_t>(nanos));
+ }
++std::chrono::steady_clock::time_point SchedulingNow() noexcept {
++    return std::chrono::steady_clock::now();
+ }
++}
+--- a/include/netplay/input_tape.h
++++ b/include/netplay/input_tape.h
+@@ -8,6 +8,9 @@
+ bool Recording() noexcept;
+ bool Replaying() noexcept;
+ void Record(const MotionBatch& batch);
++// Diagnostic only: compare translated MotionPlus outputs after each batch.
++// A matching hash is NOT proof of matching complete game state.
++void ObserveSolverResult(uint64_t sequence, uint64_t hash);
+ // Empty at a clean end marker. The caller exits without unwinding native fibers.
+ std::optional<MotionBatch> Replay(uint64_t displayFrame, uint8_t motionPlusMode);
+ void Finish();
+--- a/src/netplay/input_tape.cpp
++++ b/src/netplay/input_tape.cpp
+@@ -15,8 +15,10 @@
+ struct Tape {
+     Mode mode = Mode::Off;
+     FILE* file = nullptr;
++    FILE* solverFile = nullptr;
+     uint64_t sequence = 0;
+-    ~Tape() { if (file) std::fclose(file); }
++    uint64_t solverMismatches = 0;
++    ~Tape() { if (file) std::fclose(file); if (solverFile) std::fclose(solverFile); }
+ } tape;
+ 
+ void Write(const void* data, size_t size) {
+@@ -101,9 +103,50 @@
+     }
+     std::fprintf(stderr, "[riisorted] motion %s: %s (experimental; runtime time is still offline)\n",
+                  record ? "recording" : "playback", record ? record : replay);
++    const std::string solverPath = std::string(record ? record : replay) + ".solver";
++    tape.solverFile = Open(solverPath.c_str(), record != nullptr);
++    if (record && !tape.solverFile) throw std::runtime_error("Cannot create MotionPlus comparison file");
++    constexpr char solverMagic[] = "RIISCHK1";
++    if (tape.solverFile) {
++        if (record) {
++            if (std::fwrite(solverMagic, 1, 8, tape.solverFile) != 8)
++                throw std::runtime_error("Cannot write MotionPlus comparison header");
++        } else {
++            char received[8];
++            if (std::fread(received, 1, 8, tape.solverFile) != 8 || std::memcmp(received, solverMagic, 8))
++                throw std::runtime_error("Invalid MotionPlus comparison header");
++        }
++    } else {
++        std::fprintf(stderr, "[riisorted] older recording: no MotionPlus result comparisons available\n");
++    }
+ }
+ bool Recording() noexcept { return tape.mode == Mode::Record; }
+ bool Replaying() noexcept { return tape.mode == Mode::Replay; }
++
++void ObserveSolverResult(uint64_t sequence, uint64_t hash) {
++    if (!tape.solverFile) return;
++    uint8_t bytes[16];
++    for (size_t i = 0; i < 8; ++i) {
++        bytes[i] = uint8_t(sequence >> ((7 - i) * 8));
++        bytes[8 + i] = uint8_t(hash >> ((7 - i) * 8));
++    }
++    if (Recording()) {
++        if (std::fwrite(bytes, 1, sizeof(bytes), tape.solverFile) != sizeof(bytes) ||
++            std::fflush(tape.solverFile))
++            throw std::runtime_error("Could not write MotionPlus comparison");
++    } else {
++        uint8_t expected[16];
++        if (std::fread(expected, 1, sizeof(expected), tape.solverFile) != sizeof(expected))
++            throw std::runtime_error("Incomplete MotionPlus comparison file");
++        if (std::memcmp(expected, bytes, 8))
++            throw std::runtime_error("MotionPlus comparison sequence mismatch");
++        if (std::memcmp(expected + 8, bytes + 8, 8)) {
++            if (tape.solverMismatches++ == 0)
++                std::fprintf(stderr, "[riisorted] first MotionPlus solver output difference at batch %llu\n",
++                             static_cast<unsigned long long>(sequence));
++        }
++    }
++}
+ 
+ void Record(const MotionBatch& batch) {
+     if (!Recording()) return;
+@@ -122,6 +165,8 @@
+     if (size == 0) {
+         if (checksum || std::fgetc(tape.file) != EOF || std::ferror(tape.file))
+             throw std::runtime_error("Invalid motion recording end marker");
++        if (tape.solverFile && (std::fgetc(tape.solverFile) != EOF || std::ferror(tape.solverFile)))
++            throw std::runtime_error("MotionPlus comparison has unexpected trailing data");
+         return std::nullopt;
+     }
+     if (size > kMaxMotionPacketBytes) throw std::runtime_error("Motion recording packet exceeds size limit");
+@@ -145,6 +190,16 @@
+         Write32(0);
+         Write32(0);
+     }
++    if (tape.solverFile) {
++        FILE* solver = tape.solverFile;
++        tape.solverFile = nullptr;
++        if (std::fclose(solver)) throw std::runtime_error("Could not close MotionPlus comparison file");
++        if (Replaying())
++            std::fprintf(stderr, "[riisorted] MotionPlus comparison: %llu differing batches\n",
++                         static_cast<unsigned long long>(tape.solverMismatches));
++        else
++            std::fprintf(stderr, "[riisorted] MotionPlus result checkpoints saved\n");
++    }
+     FILE* file = tape.file;
+     tape.file = nullptr;
+     tape.mode = Mode::Off;
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -232,6 +232,15 @@
+ 
+ namespace Tape = Riisorted::Netplay::InputTape;
+ Riisorted::Netplay::MotionBatch g_capture;
++uint64_t g_solverHash = 14695981039346656037ull;
++
++void AccumulateSolverResult(const Sample& sample) {
++    if (!Tape::Recording() && !Tape::Replaying()) return;
++    const auto add = [](uint8_t byte) { g_solverHash = (g_solverHash ^ byte) * 1099511628211ull; };
++    add(sample.sdkMpls ? 1 : 0);
++    for (uint32_t word : sample.mpls)
++        for (int shift = 24; shift >= 0; shift -= 8) add(static_cast<uint8_t>(word >> shift));
++}
+ 
+ void CaptureMappedSample(const Sample& s) {
+     if (!Tape::Recording()) return;
+@@ -529,6 +538,7 @@
+         s.dt = sdt;
+         CaptureMappedSample(s);
+         if (RequestedMplsMode(0)) ProcessMotionPlus(s);
++        AccumulateSolverResult(s);
+         r.prevR = s.R;
+         r.prevGyro = s.gyro;
+         gen[i] = s;
+@@ -701,6 +711,7 @@
+         r.angle=r.angle+gyro*(dt/kMplsUnitRadPerSec);s.angle=r.angle;
+         CaptureMappedSample(s);
+         if(RequestedMplsMode(0))ProcessMotionPlus(s);
++        AccumulateSolverResult(s);
+         generated.push_back(s);
+         if(generated.size()>16)generated.pop_front();
+     };
+@@ -732,6 +743,7 @@
+ }
+ 
+ uint32_t Step(uint32_t maxSamples) {
++    g_solverHash = 14695981039346656037ull;
+     if (Tape::Replaying()) {
+         auto next = Tape::Replay(static_cast<uint64_t>(g_gxFrameCount), RequestedMplsMode(0));
+         if (!next) {
+@@ -749,12 +761,14 @@
+         for (const auto& input : batch.samples) {
+             Sample s = RestoreMappedSample(input);
+             if (batch.motionPlusMode) ProcessMotionPlus(s);
++            AccumulateSolverResult(s);
+             history.push_back(s);
+             if (history.size() > 16) history.pop_front();
+         }
+         g_remote.recentCount = static_cast<uint32_t>(history.size());
+         for (uint32_t i = 0; i < g_remote.recentCount; ++i)
+             g_remote.recent[i] = history[history.size() - 1 - i];
++        Tape::ObserveSolverResult(batch.sequence, g_solverHash);
+         return g_remote.recentCount;
+     }
+     if (Tape::Recording()) {
+@@ -764,7 +778,10 @@
+         g_capture.motionPlusMode = RequestedMplsMode(0);
+     }
+     const uint32_t count = StepLive(maxSamples);
+-    if (Tape::Recording()) Tape::Record(g_capture);
++    if (Tape::Recording()) {
++        Tape::Record(g_capture);
++        Tape::ObserveSolverResult(g_capture.sequence, g_solverHash);
++    }
+     return count;
+ }
+ 

@@ -1,0 +1,56 @@
+diff --git a/translator/src/Translator.Core/Disassembly/JumpTableDetector.cs b/translator/src/Translator.Core/Disassembly/JumpTableDetector.cs
+index 73a0eb6..4881251 100644
+--- a/translator/src/Translator.Core/Disassembly/JumpTableDetector.cs
++++ b/translator/src/Translator.Core/Disassembly/JumpTableDetector.cs
+@@ -383,22 +383,46 @@ internal static class JumpTableDetector
+ 
+     private static bool TryFindUpperBound(IReadOnlyList<PpcInstruction> ordered, int startIndex, string register, out int upperBound)
+     {
+-        // Preferred: compare directly on the same register used for lwzx indexing.
++        // Preferred: the bound check on the index register, followed back through the instruction that
++        // produced it. The usual CodeWarrior shape is
++        //     cmplwi rI, N ; bgt default ; lis rT, hi ; slwi rX, rI, 2 ; addi rT, rT, lo ; lwzx rC, rT, rX
++        // so the compare is on rI, not on the lwzx index rX. Matching only rX (as before) could pick up an
++        // unrelated, older `cmpwi rX, k` further up a large function and truncate the table (Wii Sports
++        // Resort's nw4r::ef::ParticleManager::Calc lost cases 4..8 that way). Once the tracked register's
++        // defining instruction is reached, older compares on it describe a different value and are ignored.
++        var tracked = register;
+         for (var i = startIndex - 1; i >= 0 && startIndex - i <= MaxBacktrackInstructions; i--)
+         {
+             var ins = ordered[i];
+             if (ins.Operands.Count < 2 || ins.Operands[0] is not PpcRegisterOperand reg ||
+-                !string.Equals(reg.Name, register, StringComparison.OrdinalIgnoreCase) ||
+-                ins.Operands[1] is not PpcImmediateOperand imm)
++                !RegistersEqual(reg.Name, tracked))
+             {
+                 continue;
+             }
+ 
+             if (ins.Mnemonic is "cmplwi" or "cmpwi")
+             {
+-                upperBound = imm.Value;
+-                return true;
++                if (ins.Operands[1] is PpcImmediateOperand imm)
++                {
++                    upperBound = imm.Value;
++                    return true;
++                }
++                continue;
++            }
++
++            if (ins.Mnemonic is "cmplw" or "cmpw")
++            {
++                continue; // compares do not define the register
++            }
++
++            if (ins.Mnemonic is "slwi" or "rlwinm" or "mr" or "clrlwi" or "clrlslwi" or "extsb" or "extsh" &&
++                ins.Operands[1] is PpcRegisterOperand source)
++            {
++                tracked = source.Name;
++                continue;
+             }
++
++            break; // defined by something we cannot follow; use the fallback below
+         }
+ 
+         // Fallback: some loops compare a logical counter (e.g. r18) distinct from the byte-offset

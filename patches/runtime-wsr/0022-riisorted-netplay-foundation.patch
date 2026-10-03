@@ -1,0 +1,720 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -63,6 +63,7 @@
+ #include "fiber_manager.h"
+ #include "hle_stubs.h"
+ #include "runtime_config.h"
++#include "netplay/input_tape.h"
+ #include "runtime_log.h"
+ #include "runtime_product.h"
+ #include "recomp_mod_loader.h"
+@@ -1241,6 +1242,17 @@
+ 
+ // Global handler called via atexit() to flush buffers before any exit
+ static void AtExitHandler() {
++    // OSExit uses std::exit instead of returning to RuntimeMain. Only seal a
++    // successful exit; crashes must retain their missing-end-marker status.
++    if (g_exitCodeSet.load(std::memory_order_relaxed) &&
++        g_lastExitCode.load(std::memory_order_relaxed) == 0 &&
++        !g_fatalErrorReported.load(std::memory_order_acquire)) {
++        try {
++            Riisorted::Netplay::InputTape::Finish();
++        } catch (const std::exception& ex) {
++            std::fprintf(stderr, "[riisorted] motion tape finalization failed: %s\n", ex.what());
++        }
++    }
+     // End-of-run guest memory report. This runs before the fatal-report check
+     // below because the counters describe the whole session and are just as
+     // interesting after a crash as after a clean exit.
+@@ -1327,6 +1339,7 @@
+             throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
+         }
+         RuntimeConfigFile::LogLoadedConfig();
++        Riisorted::Netplay::InputTape::InitializeFromEnvironment();
+         if (RuntimeConfigFile::DiscordPresenceEnabled()) {
+             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
+         }
+@@ -1481,6 +1494,7 @@
+         WindowPlacementPersistence::Flush(true);
+         aurora_shutdown();
+         DiscordPresence::Shutdown();
++        Riisorted::Netplay::InputTape::Finish();
+         SetRuntimeExitCodeImpl(0);
+         ShutdownProcessTranscript();
+         return 0;
+--- a/src/ppc_helpers.cpp
++++ b/src/ppc_helpers.cpp
+@@ -4,11 +4,10 @@
+ #include "isa/ppc_isa_cr.h"
+ #include "memory.h"
+ #include "runtime_log.h"
+-#include "timebase_contract.h"
++#include "guest_clock.h"
+ 
+ #include <array>
+ #include <bitset>
+-#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -42,13 +41,8 @@
+ std::array<uint32_t, 2048> g_sprShadow{};
+ uint32_t g_reservationAddr = 0;
+ bool g_hasReservation = false;
+-const auto g_timeBaseStart = std::chrono::steady_clock::now();
+-
+ uint64_t GetTimeBase() {
+-    const auto elapsed = std::chrono::steady_clock::now() - g_timeBaseStart;
+-    const auto nanoseconds =
+-        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+-    return TimeBaseContract::NanosecondsToTicks(static_cast<uint64_t>(nanoseconds));
++    return GuestClock::ReadTimeBase();
+ }
+ 
+ constexpr uint32_t kFpscrFx = 1u << 31;
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -33,6 +33,8 @@
+ 
+ #include "guest_interrupt_context.h"
+ #include "resort_motion.h"
++#include "netplay/input_tape.h"
++#include "aurora_events.h"
+ extern "C" int g_gxFrameCount;
+ extern "C" void func_800CFCB0(CpuContext*);
+ extern "C" void func_800CE180(CpuContext*);
+@@ -228,6 +230,46 @@
+ 
+ Remote g_remote;
+ 
++namespace Tape = Riisorted::Netplay::InputTape;
++Riisorted::Netplay::MotionBatch g_capture;
++
++void CaptureMappedSample(const Sample& s) {
++    if (!Tape::Recording()) return;
++    if (g_capture.samples.size() == Riisorted::Netplay::kMaxMotionSamples)
++        throw std::runtime_error("Motion capture backlog exceeds the bounded sample window");
++    Riisorted::Netplay::MotionSample input;
++    input.buttons = s.hold;
++    for (size_t row = 0; row < 3; ++row)
++        for (size_t col = 0; col < 3; ++col)
++            input.orientation[row * 3 + col] = s.R.m[row][col];
++    input.gyro = {s.gyro.x, s.gyro.y, s.gyro.z};
++    input.angle = {s.angle.x, s.angle.y, s.angle.z};
++    input.acceleration = {s.acc.x, s.acc.y, s.acc.z};
++    input.seconds = s.dt;
++    input.pointerX = s.posX;
++    input.pointerY = s.posY;
++    input.roll = s.roll;
++    input.pointerValid = s.pointerValid;
++    g_capture.samples.push_back(input);
++}
++
++Sample RestoreMappedSample(const Riisorted::Netplay::MotionSample& input) {
++    Sample s;
++    s.hold = input.buttons;
++    for (size_t row = 0; row < 3; ++row)
++        for (size_t col = 0; col < 3; ++col)
++            s.R.m[row][col] = input.orientation[row * 3 + col];
++    s.gyro = {input.gyro[0], input.gyro[1], input.gyro[2]};
++    s.angle = {input.angle[0], input.angle[1], input.angle[2]};
++    s.acc = {input.acceleration[0], input.acceleration[1], input.acceleration[2]};
++    s.dt = input.seconds;
++    s.posX = input.pointerX;
++    s.posY = input.pointerY;
++    s.roll = input.roll;
++    s.pointerValid = input.pointerValid;
++    return s;
++}
++
+ void LoadConventions() {
+     if (const char* s = std::getenv("RESORT_MPLS_SIGNS")) {
+         double a = 1, b = 1, c = 1;
+@@ -258,6 +300,9 @@
+ }
+ 
+ bool VirtualRemoteActive(uint32_t chan) {
++    if (Tape::Replaying()) return chan == 0;
++    if (chan == 0 && Tape::Recording() && WiiRemoteInput::IsRemoteChannel(0))
++        throw std::runtime_error("Motion recording currently supports the virtual remote only");
+     // A real Bluetooth remote on the channel wins; the virtual one only stands in for channel 0.
+     return chan == 0 && !WiiRemoteInput::IsRemoteChannel(0);
+ }
+@@ -383,7 +428,7 @@
+ 
+ // ------------------------------------------------------------------------------------------------ simulation
+ // Advances the remote by one frame of host input and returns how many 200 Hz samples to emit.
+-uint32_t Step(uint32_t maxSamples) {
++uint32_t StepLive(uint32_t maxSamples) {
+     Remote& r = g_remote;
+     const auto now = std::chrono::steady_clock::now();
+     double dt = r.lastRead.time_since_epoch().count() == 0 ? 1.0 / 60.0
+@@ -482,6 +527,7 @@
+         r.angle = r.angle + s.gyro * (sdt / kMplsUnitRadPerSec);
+         s.angle = r.angle;
+         s.dt = sdt;
++        CaptureMappedSample(s);
+         if (RequestedMplsMode(0)) ProcessMotionPlus(s);
+         r.prevR = s.R;
+         r.prevGyro = s.gyro;
+@@ -630,6 +676,7 @@
+ uint32_t StepController(const HostInput& in) {
+     Remote& r=g_remote;
+     if(in.recenter && !r.recenterHeld) {
++        if (Tape::Recording()) g_capture.recenter = true;
+         r.pointerPose={};
+         GuestInterruptCallbackContext call;
+         call.get()->gpr[3]=0;
+@@ -652,6 +699,7 @@
+         }
+         s.roll=std::atan2(s.R.m[0][1],s.R.m[1][1]);
+         r.angle=r.angle+gyro*(dt/kMplsUnitRadPerSec);s.angle=r.angle;
++        CaptureMappedSample(s);
+         if(RequestedMplsMode(0))ProcessMotionPlus(s);
+         generated.push_back(s);
+         if(generated.size()>16)generated.pop_front();
+@@ -683,8 +731,46 @@
+     return n;
+ }
+ 
++uint32_t Step(uint32_t maxSamples) {
++    if (Tape::Replaying()) {
++        auto next = Tape::Replay(static_cast<uint64_t>(g_gxFrameCount), RequestedMplsMode(0));
++        if (!next) {
++            std::fprintf(stderr, "[riisorted] motion input playback completed\n");
++            std::fflush(stderr);
++            ExitForAuroraWindowClose();
++        }
++        const auto& batch = *next;
++        if (batch.recenter) {
++            GuestInterruptCallbackContext call;
++            call.get()->gpr[3] = 0;
++            func_800CE180(call.get());
++        }
++        std::deque<Sample> history;
++        for (const auto& input : batch.samples) {
++            Sample s = RestoreMappedSample(input);
++            if (batch.motionPlusMode) ProcessMotionPlus(s);
++            history.push_back(s);
++            if (history.size() > 16) history.pop_front();
++        }
++        g_remote.recentCount = static_cast<uint32_t>(history.size());
++        for (uint32_t i = 0; i < g_remote.recentCount; ++i)
++            g_remote.recent[i] = history[history.size() - 1 - i];
++        return g_remote.recentCount;
++    }
++    if (Tape::Recording()) {
++        g_capture = {};
++        g_capture.sequence = g_remote.batch;
++        g_capture.interval = static_cast<uint64_t>(g_gxFrameCount);
++        g_capture.motionPlusMode = RequestedMplsMode(0);
++    }
++    const uint32_t count = StepLive(maxSamples);
++    if (Tape::Recording()) Tape::Record(g_capture);
++    return count;
++}
++
+ // ------------------------------------------------------------------------------------------------ public hooks
+ bool CursorShouldHide() {
++    if (Tape::Replaying()) return false;
+     return VirtualRemoteActive(0) && !DualSenseGamepad() && SDL_GetKeyboardFocus() != nullptr &&
+            !InputBindings::InputBlocked();
+ }
+@@ -692,11 +778,13 @@
+ bool DualSenseActive() { return VirtualRemoteActive(0) && DualSenseGamepad() != nullptr; }
+ 
+ const char* ActiveInputName() {
++    if (Tape::Replaying()) return "Motion input playback";
+     if (WiiRemoteInput::IsRemoteChannel(0)) return "Wii Remote (Bluetooth)";
+     return DualSenseActive() ? "DualSense gyro" : "Keyboard and mouse";
+ }
+ 
+ void HandleSdlEvent(const SDL_Event& ev) {
++    if (Tape::Replaying()) return;
+     if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && ev.gsensor.which == g_remote.activeGamepad &&
+         !InputBindings::InputBlocked()) {
+         const auto& e = ev.gsensor;
+--- a/include/aurora_events.h
++++ b/include/aurora_events.h
+@@ -2,6 +2,7 @@
+ 
+ #include "settings_overlay.h"
+ #include "runtime_config.h"
++#include "netplay/input_tape.h"
+ 
+ #include <aurora/aurora.h>
+ #include <aurora/event.h>
+@@ -60,6 +61,15 @@
+ // still active.  A window close is an intentional successful exit, so end the
+ // process directly and do not run the crash/atexit paths.
+ [[noreturn]] inline void ExitForAuroraWindowClose() noexcept {
++    // Window close bypasses atexit when called on a guest fiber. Seal the input
++    // tape explicitly so a successful user exit has a verifiable end marker.
++    try {
++        Riisorted::Netplay::InputTape::Finish();
++    } catch (const std::exception& ex) {
++        std::fprintf(stderr, "[riisorted] motion tape close failed: %s\n", ex.what());
++        std::fflush(stderr);
++        std::_Exit(EXIT_FAILURE);
++    }
+     settings_overlay::ReleaseControllers();
+     WindowPlacementPersistence::Flush(true);
+ #if defined(_WIN32)
+--- /dev/null
++++ b/include/guest_clock.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include <cstdint>
++
++// Central entry point for guest-visible time. Offline time retains its real-time
++// behavior. Session clock activation is intentionally unavailable until all VI,
++// alarm, sleep and audio event sources obey deterministic scheduling.
++namespace GuestClock {
++uint64_t ReadTimeBase() noexcept;
++}
+--- /dev/null
++++ b/src/guest_clock.cpp
+@@ -0,0 +1,14 @@
++#include "guest_clock.h"
++#include "timebase_contract.h"
++#include <chrono>
++
++namespace GuestClock {
++namespace {
++const auto start = std::chrono::steady_clock::now();
++}
++uint64_t ReadTimeBase() noexcept {
++    const auto elapsed = std::chrono::steady_clock::now() - start;
++    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
++    return TimeBaseContract::NanosecondsToTicks(static_cast<uint64_t>(nanos));
++}
++}
+--- /dev/null
++++ b/include/netplay/session.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <optional>
++#include <vector>
++
++namespace Riisorted::Netplay {
++
++inline constexpr uint32_t kProtocolVersion = 1;
++// Preserve solver inputs even when a device backlog exceeds KPAD's 16-entry
++// output history. Oversized backlogs fail explicitly rather than lose motion.
++inline constexpr size_t kMaxMotionSamples = 128;
++inline constexpr size_t kMaxMotionPacketBytes = 24 + kMaxMotionSamples * 181;
++
++// The locally mapped sensor input BEFORE the translated MotionPlus solver.
++// IEEE binary64 fields retain the existing mapper's rounding points. The wire
++// format writes each field explicitly; this struct is never memcpy-serialized.
++struct MotionSample {
++    uint32_t buttons = 0;
++    std::array<double, 9> orientation{1,0,0, 0,1,0, 0,0,1};
++    std::array<double, 3> gyro{};
++    std::array<double, 3> angle{};
++    std::array<double, 3> acceleration{0,-1,0};
++    double seconds = 0.005;
++    double pointerX = 0, pointerY = 0, roll = 0;
++    bool pointerValid = false;
++};
++
++struct MotionBatch {
++    uint64_t sequence = 0;
++    uint64_t interval = 0;
++    uint8_t channel = 0;
++    uint8_t motionPlusMode = 0;
++    bool recenter = false;
++    // Oldest first: the solver must consume samples in their original order.
++    std::vector<MotionSample> samples;
++};
++
++std::vector<uint8_t> EncodeMotionBatch(const MotionBatch& batch);
++MotionBatch DecodeMotionBatch(const std::vector<uint8_t>& bytes);
++
++// Logical Broadway time, advanced only by an agreed simulation event. No
++// wall-clock reads and no implicit advancement when the network is waiting.
++class SimulationClock {
++public:
++    uint64_t Ticks() const noexcept { return ticks_; }
++    void AdvanceTo(uint64_t ticks);
++    // Exact rational intervals; 60 Hz is 1,012,500 Broadway ticks per interval.
++    void AdvanceInterval(uint32_t hz);
++private:
++    uint64_t ticks_ = 0;
++    uint64_t remainder_ = 0;
++    uint32_t rate_ = 0;
++};
++
++struct AgreedInputs {
++    uint64_t interval = 0;
++    std::array<MotionBatch, 2> players;
++};
++
++// Transport-independent two-player gate. A missing batch never becomes a
++// predicted/neutral swing. The caller alone advances simulation after Take().
++class LockstepQueue {
++public:
++    explicit LockstepQueue(uint64_t firstInterval = 0, uint32_t capacity = 120);
++    void Submit(MotionBatch batch);
++    bool Ready() const;
++    std::optional<AgreedInputs> Take();
++    uint64_t NextInterval() const noexcept { return next_; }
++private:
++    uint64_t next_;
++    uint32_t capacity_;
++    std::array<std::map<uint64_t, MotionBatch>, 2> pending_;
++};
++
++} // namespace Riisorted::Netplay
+--- /dev/null
++++ b/src/netplay/session.cpp
+@@ -0,0 +1,169 @@
++#include "netplay/session.h"
++#include "timebase_contract.h"
++
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <utility>
++
++namespace Riisorted::Netplay {
++namespace {
++static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559);
++constexpr size_t kSampleBytes = 4 + 22 * 8 + 1;
++constexpr size_t kHeaderBytes = 4 + 8 + 8 + 4;
++static_assert(kHeaderBytes + kMaxMotionSamples * kSampleBytes == kMaxMotionPacketBytes);
++
++void Put(std::vector<uint8_t>& out, uint64_t value, size_t count) {
++    for (size_t i = count; i != 0; --i)
++        out.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8)));
++}
++void PutDouble(std::vector<uint8_t>& out, double value) {
++    if (!std::isfinite(value)) throw std::invalid_argument("Non-finite motion input");
++    uint64_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    Put(out, bits, 8);
++}
++class Reader {
++public:
++    explicit Reader(const std::vector<uint8_t>& data) : data_(data) {}
++    uint64_t Get(size_t count) {
++        if (count > data_.size() - offset_) throw std::invalid_argument("Truncated motion packet");
++        uint64_t result = 0;
++        while (count--) result = (result << 8) | data_[offset_++];
++        return result;
++    }
++    double Double() {
++        uint64_t bits = Get(8);
++        double result;
++        std::memcpy(&result, &bits, sizeof(result));
++        if (!std::isfinite(result)) throw std::invalid_argument("Non-finite motion input");
++        return result;
++    }
++private:
++    const std::vector<uint8_t>& data_;
++    size_t offset_ = 0;
++};
++void Validate(const MotionBatch& batch) {
++    if (batch.channel >= 2 || batch.samples.empty() || batch.samples.size() > kMaxMotionSamples ||
++        batch.motionPlusMode > 5)
++        throw std::invalid_argument("Invalid motion batch metadata");
++    for (const auto& sample : batch.samples) {
++        if (!(sample.seconds > 0 && sample.seconds <= 0.1))
++            throw std::invalid_argument("Invalid motion sample duration");
++    }
++}
++} // namespace
++
++std::vector<uint8_t> EncodeMotionBatch(const MotionBatch& batch) {
++    Validate(batch);
++    std::vector<uint8_t> out;
++    out.reserve(kHeaderBytes + batch.samples.size() * kSampleBytes);
++    Put(out, kProtocolVersion, 4);
++    Put(out, batch.sequence, 8);
++    Put(out, batch.interval, 8);
++    Put(out, batch.channel, 1);
++    Put(out, batch.motionPlusMode, 1);
++    Put(out, batch.recenter, 1);
++    Put(out, batch.samples.size(), 1);
++    for (const auto& sample : batch.samples) {
++        Put(out, sample.buttons, 4);
++        for (double value : sample.orientation) PutDouble(out, value);
++        for (double value : sample.gyro) PutDouble(out, value);
++        for (double value : sample.angle) PutDouble(out, value);
++        for (double value : sample.acceleration) PutDouble(out, value);
++        PutDouble(out, sample.seconds);
++        PutDouble(out, sample.pointerX);
++        PutDouble(out, sample.pointerY);
++        PutDouble(out, sample.roll);
++        Put(out, sample.pointerValid, 1);
++    }
++    return out;
++}
++
++MotionBatch DecodeMotionBatch(const std::vector<uint8_t>& bytes) {
++    if (bytes.size() < kHeaderBytes || bytes.size() > kHeaderBytes + kMaxMotionSamples * kSampleBytes)
++        throw std::invalid_argument("Invalid motion packet size");
++    Reader in(bytes);
++    if (in.Get(4) != kProtocolVersion) throw std::invalid_argument("Motion protocol version mismatch");
++    MotionBatch batch;
++    batch.sequence = in.Get(8);
++    batch.interval = in.Get(8);
++    batch.channel = static_cast<uint8_t>(in.Get(1));
++    batch.motionPlusMode = static_cast<uint8_t>(in.Get(1));
++    const auto recenter = in.Get(1);
++    const auto count = in.Get(1);
++    if (recenter > 1 || count == 0 || count > kMaxMotionSamples ||
++        bytes.size() != kHeaderBytes + count * kSampleBytes)
++        throw std::invalid_argument("Invalid motion packet layout");
++    batch.recenter = recenter != 0;
++    batch.samples.resize(count);
++    for (auto& sample : batch.samples) {
++        sample.buttons = static_cast<uint32_t>(in.Get(4));
++        for (double& value : sample.orientation) value = in.Double();
++        for (double& value : sample.gyro) value = in.Double();
++        for (double& value : sample.angle) value = in.Double();
++        for (double& value : sample.acceleration) value = in.Double();
++        sample.seconds = in.Double();
++        sample.pointerX = in.Double();
++        sample.pointerY = in.Double();
++        sample.roll = in.Double();
++        const auto valid = in.Get(1);
++        if (valid > 1) throw std::invalid_argument("Invalid pointer validity flag");
++        sample.pointerValid = valid != 0;
++    }
++    Validate(batch);
++    return batch;
++}
++
++void SimulationClock::AdvanceTo(uint64_t ticks) {
++    if (ticks < ticks_) throw std::invalid_argument("Simulation time cannot go backwards");
++    ticks_ = ticks;
++    remainder_ = 0;
++    rate_ = 0;
++}
++void SimulationClock::AdvanceInterval(uint32_t hz) {
++    if (hz == 0 || (rate_ && rate_ != hz))
++        throw std::invalid_argument("Clock rate changes require an explicit time boundary");
++    const uint64_t total = TimeBaseContract::kTicksPerSecond + remainder_;
++    const uint64_t delta = total / hz;
++    if (delta > UINT64_MAX - ticks_) throw std::overflow_error("Simulation clock overflow");
++    rate_ = hz;
++    remainder_ = total % hz;
++    ticks_ += delta;
++}
++
++LockstepQueue::LockstepQueue(uint64_t firstInterval, uint32_t capacity)
++    : next_(firstInterval), capacity_(capacity) {
++    if (capacity == 0 || capacity > 600) throw std::invalid_argument("Invalid input queue capacity");
++}
++void LockstepQueue::Submit(MotionBatch batch) {
++    // Validate even locally supplied input through the same canonical codec.
++    const auto encoded = EncodeMotionBatch(batch);
++    if (batch.interval < next_) return; // Already agreed/consumed retransmission.
++    if (batch.interval - next_ >= capacity_) throw std::invalid_argument("Input beyond session window");
++    auto& queue = pending_[batch.channel];
++    auto found = queue.find(batch.interval);
++    if (found != queue.end()) {
++        if (EncodeMotionBatch(found->second) != encoded)
++            throw std::invalid_argument("Conflicting input for an existing session interval");
++        return;
++    }
++    queue.emplace(batch.interval, std::move(batch));
++}
++bool LockstepQueue::Ready() const {
++    return pending_[0].count(next_) && pending_[1].count(next_);
++}
++std::optional<AgreedInputs> LockstepQueue::Take() {
++    if (!Ready()) return std::nullopt;
++    if (next_ == UINT64_MAX) throw std::overflow_error("Session interval overflow");
++    AgreedInputs result;
++    result.interval = next_;
++    for (size_t i = 0; i < 2; ++i) {
++        result.players[i] = std::move(pending_[i].at(next_));
++        pending_[i].erase(next_);
++    }
++    ++next_;
++    return result;
++}
++} // namespace Riisorted::Netplay
+--- /dev/null
++++ b/include/netplay/input_tape.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include "netplay/session.h"
++
++namespace Riisorted::Netplay::InputTape {
++// Experimental local motion playback, NOT a complete deterministic game replay.
++// RESORT_INPUT_RECORD and RESORT_INPUT_REPLAY are mutually exclusive file paths.
++void InitializeFromEnvironment();
++bool Recording() noexcept;
++bool Replaying() noexcept;
++void Record(const MotionBatch& batch);
++// Empty at a clean end marker. The caller exits without unwinding native fibers.
++std::optional<MotionBatch> Replay(uint64_t displayFrame, uint8_t motionPlusMode);
++void Finish();
++}
+--- /dev/null
++++ b/src/netplay/input_tape.cpp
+@@ -0,0 +1,155 @@
++#include "netplay/input_tape.h"
++
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <string>
++#include <stdexcept>
++
++namespace Riisorted::Netplay::InputTape {
++namespace {
++enum class Mode { Off, Record, Replay };
++struct Tape {
++    Mode mode = Mode::Off;
++    FILE* file = nullptr;
++    uint64_t sequence = 0;
++    ~Tape() { if (file) std::fclose(file); }
++} tape;
++
++void Write(const void* data, size_t size) {
++    if (std::fwrite(data, 1, size, tape.file) != size)
++        throw std::runtime_error("Could not write motion input recording");
++}
++void Read(void* data, size_t size) {
++    if (std::fread(data, 1, size, tape.file) != size)
++        throw std::runtime_error("Incomplete motion recording: missing data or clean end marker");
++}
++void Write32(uint32_t value) {
++    const uint8_t bytes[]{uint8_t(value >> 24), uint8_t(value >> 16), uint8_t(value >> 8), uint8_t(value)};
++    Write(bytes, sizeof(bytes));
++}
++uint32_t Read32() {
++    uint8_t bytes[4];
++    Read(bytes, sizeof(bytes));
++    return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
++           (uint32_t(bytes[2]) << 8) | bytes[3];
++}
++uint32_t Checksum(const std::vector<uint8_t>& bytes) {
++    uint32_t value = 2166136261u;
++    for (uint8_t byte : bytes) value = (value ^ byte) * 16777619u;
++    return value;
++}
++std::array<uint8_t, 32> Conventions() {
++    std::array<double, 4> values{1,1,1,1};
++    if (const char* text = std::getenv("RESORT_MPLS_SIGNS")) {
++        double a = 1, b = 1, c = 1;
++        if (std::sscanf(text, "%lf,%lf,%lf", &a, &b, &c) == 3)
++            values[0] = a, values[1] = b, values[2] = c;
++    }
++    if (const char* text = std::getenv("RESORT_MPLS_DIRSIGN"))
++        values[3] = std::atof(text) < 0 ? -1 : 1;
++    std::array<uint8_t, 32> result{};
++    for (size_t i = 0; i < values.size(); ++i) {
++        if (!std::isfinite(values[i])) throw std::invalid_argument("Invalid MotionPlus conventions");
++        uint64_t bits;
++        std::memcpy(&bits, &values[i], sizeof(bits));
++        for (size_t j = 0; j < 8; ++j) result[i * 8 + j] = uint8_t(bits >> ((7 - j) * 8));
++    }
++    return result;
++}
++FILE* Open(const char* path, bool record) {
++#ifdef _WIN32
++    return _wfopen(std::filesystem::u8path(path).c_str(), record ? L"wbx" : L"rb");
++#else
++    return std::fopen(path, record ? "wbx" : "rb");
++#endif
++}
++} // namespace
++
++void InitializeFromEnvironment() {
++    const char* record = std::getenv("RESORT_INPUT_RECORD");
++    const char* replay = std::getenv("RESORT_INPUT_REPLAY");
++    if (record && !*record) record = nullptr;
++    if (replay && !*replay) replay = nullptr;
++    if (record && replay) throw std::invalid_argument("Choose motion recording OR playback");
++    if (!record && !replay) return;
++    if (tape.file) throw std::logic_error("Motion tape already initialized");
++    const auto conventions = Conventions();
++    tape.file = Open(record ? record : replay, record != nullptr);
++    if (!tape.file) throw std::runtime_error(record
++        ? "Cannot create motion recording (choose a new file in an existing folder)"
++        : "Cannot open motion recording for playback");
++    constexpr std::array<char, 8> magic{'R','I','I','S','I','N','P','1'};
++    if (record) {
++        Write(magic.data(), magic.size());
++        Write32(kProtocolVersion);
++        Write(conventions.data(), conventions.size());
++        tape.mode = Mode::Record;
++    } else {
++        std::array<char, 8> received;
++        Read(received.data(), received.size());
++        if (received != magic || Read32() != kProtocolVersion)
++            throw std::runtime_error("Incompatible motion recording version");
++        std::array<uint8_t, 32> receivedConventions;
++        Read(receivedConventions.data(), receivedConventions.size());
++        if (receivedConventions != conventions)
++            throw std::runtime_error("MotionPlus conventions differ from the recording");
++        tape.mode = Mode::Replay;
++    }
++    std::fprintf(stderr, "[riisorted] motion %s: %s (experimental; runtime time is still offline)\n",
++                 record ? "recording" : "playback", record ? record : replay);
++}
++bool Recording() noexcept { return tape.mode == Mode::Record; }
++bool Replaying() noexcept { return tape.mode == Mode::Replay; }
++
++void Record(const MotionBatch& batch) {
++    if (!Recording()) return;
++    if (batch.sequence != tape.sequence) throw std::logic_error("Motion recording sequence mismatch");
++    const auto bytes = EncodeMotionBatch(batch);
++    Write32(static_cast<uint32_t>(bytes.size()));
++    Write32(Checksum(bytes));
++    Write(bytes.data(), bytes.size());
++    if (std::fflush(tape.file) != 0) throw std::runtime_error("Cannot flush motion recording");
++    ++tape.sequence;
++}
++std::optional<MotionBatch> Replay(uint64_t displayFrame, uint8_t motionPlusMode) {
++    if (!Replaying()) throw std::logic_error("Motion playback is not active");
++    const uint32_t size = Read32();
++    const uint32_t checksum = Read32();
++    if (size == 0) {
++        if (checksum || std::fgetc(tape.file) != EOF || std::ferror(tape.file))
++            throw std::runtime_error("Invalid motion recording end marker");
++        return std::nullopt;
++    }
++    if (size > kMaxMotionPacketBytes) throw std::runtime_error("Motion recording packet exceeds size limit");
++    std::vector<uint8_t> bytes(size);
++    Read(bytes.data(), bytes.size());
++    if (Checksum(bytes) != checksum) throw std::runtime_error("Motion recording checksum mismatch");
++    MotionBatch batch = DecodeMotionBatch(bytes);
++    if (batch.channel != 0 || batch.sequence != tape.sequence || batch.interval != displayFrame ||
++        batch.motionPlusMode != motionPlusMode)
++        throw std::runtime_error("Motion playback diverged at batch " + std::to_string(tape.sequence) +
++                                 ": expected display frame " + std::to_string(batch.interval) +
++                                 ", observed " + std::to_string(displayFrame) +
++                                 "; recorded/current MotionPlus mode " +
++                                 std::to_string(batch.motionPlusMode) + "/" + std::to_string(motionPlusMode));
++    ++tape.sequence;
++    return batch;
++}
++void Finish() {
++    if (!tape.file) return;
++    if (Recording()) {
++        Write32(0);
++        Write32(0);
++    }
++    FILE* file = tape.file;
++    tape.file = nullptr;
++    tape.mode = Mode::Off;
++    if (std::fclose(file) != 0) throw std::runtime_error("Could not close motion recording");
++    std::fprintf(stderr, "[riisorted] motion tape closed after %llu batches\n",
++                 static_cast<unsigned long long>(tape.sequence));
++}
++} // namespace Riisorted::Netplay::InputTape

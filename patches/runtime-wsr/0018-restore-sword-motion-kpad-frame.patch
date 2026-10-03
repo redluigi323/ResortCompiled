@@ -1,0 +1,324 @@
+--- a/src/resort_wiimote_kbm.cpp
++++ b/src/resort_wiimote_kbm.cpp
+@@ -39,7 +39,6 @@
+ #include "wii_remote_input.h"
+ 
+ namespace ResortWiimote {
+-extern "C" bool ResortBowlingStageActive();
+ 
+ // ------------------------------------------------------------------------------------------------ guest layout
+ namespace guest {
+@@ -109,7 +108,7 @@
+ // Sign conventions of KPAD's MotionPlus output relative to our remote frame (X right, Y up out of the button
+ // face, Z towards the player; the remote points along -Z). Overridable with RESORT_MPLS_SIGNS="sx,sy,sz" and
+ // RESORT_MPLS_DIRSIGN=±1 while we confirm them against the game.
+-struct Conventions { double gyro[3] = {-1, 1, 1}; double dir = 1; };
++struct Conventions { double gyro[3] = {1, 1, 1}; double dir = 1; };
+ 
+ // ------------------------------------------------------------------------------------------------ math
+ struct Vec3 { double x = 0, y = 0, z = 0; };
+@@ -141,20 +140,17 @@
+             a.m[2][0] * v.x + a.m[2][1] * v.y + a.m[2][2] * v.z};
+ }
+ Vec3 Column(const Mat3& a, int c) { return {a.m[0][c], a.m[1][c], a.m[2][c]}; }
++// Our simulation uses X right, Y out of the button face, Z toward the
++// player. KPAD's Wii Remote frame uses X left, Y toward the player, Z out of
++// the button face. This is a proper basis rotation, not three unrelated signs.
++Vec3 ToWii(Vec3 v) { return {-v.x, v.z, v.y}; }
++Vec3 WiiDir(const Mat3& r, int axis) {
++    if (axis == 0) return ToWii(Column(r, 0) * -1.0);
++    return ToWii(Column(r, axis == 1 ? 2 : 1));
++}
+ Mat3 RotX(double t) { Mat3 r; r.m[1][1] = std::cos(t); r.m[1][2] = -std::sin(t); r.m[2][1] = std::sin(t); r.m[2][2] = std::cos(t); return r; }
+ Mat3 RotY(double t) { Mat3 r; r.m[0][0] = std::cos(t); r.m[0][2] = std::sin(t); r.m[2][0] = -std::sin(t); r.m[2][2] = std::cos(t); return r; }
+ Mat3 RotZ(double t) { Mat3 r; r.m[0][0] = std::cos(t); r.m[0][1] = -std::sin(t); r.m[1][0] = std::sin(t); r.m[1][1] = std::cos(t); return r; }
+-Mat3 RotVector(Vec3 v) {
+-    const double t = Len(v);
+-    if (t < 1e-10) return Mat3{};
+-    const Vec3 a = v * (1.0 / t);
+-    const double c = std::cos(t), s = std::sin(t), u = 1 - c;
+-    Mat3 r;
+-    r.m[0][0] = c + a.x*a.x*u; r.m[0][1] = a.x*a.y*u - a.z*s; r.m[0][2] = a.x*a.z*u + a.y*s;
+-    r.m[1][0] = a.y*a.x*u + a.z*s; r.m[1][1] = c + a.y*a.y*u; r.m[1][2] = a.y*a.z*u - a.x*s;
+-    r.m[2][0] = a.z*a.x*u - a.y*s; r.m[2][1] = a.z*a.y*u + a.x*s; r.m[2][2] = c + a.z*a.z*u;
+-    return r;
+-}
+ 
+ // Remote -> world rotation from aim angles: yaw right+, pitch up+, roll right (clockwise as seen by the player)+.
+ Mat3 Orientation(double yaw, double pitch, double roll) { return Mul(Mul(RotY(-yaw), RotX(pitch)), RotZ(-roll)); }
+@@ -210,12 +206,10 @@
+     SDL_JoystickID activeGamepad = 0;
+     SDL_JoystickID sensorEnabledFor = 0;
+     SDL_JoystickID accelEnabledFor = 0;
++    Vec3 sensorGravity{0, -1, 0};
++    bool sensorGravityValid = false;
+     Vec3 peakAccel;
+     bool peakAccelValid = false;
+-    Mat3 controllerR;
+-    Vec3 gyroBias;
+-    bool gyroBiasValid = false;
+-    bool bowlingScene = false;
+ };
+ 
+ Remote g_remote;
+@@ -264,12 +258,9 @@
+     bool controller = false;
+     uint32_t hold = 0;
+     bool tilt = false, shake = false, recenter = false;
+-    Vec3 gyro;             // SDL pad axes, retained for the established pointer mapping
+-    Vec3 motionGyro;       // flat-pad axes mapped to the virtual remote
++    Vec3 gyro;
+     Vec3 acc;
+     bool accValid = false;
+-    Vec3 peakAcc;
+-    bool peakAccValid = false;
+     double mouseX = 0, mouseY = 0;   // -1..1, +y down
+     double relX = 0, relY = 0;       // pixels since last read
+     SDL_Window* window = nullptr;
+@@ -291,10 +282,8 @@
+         g_remote.easeLeft = 0;
+         g_remote.tilting = false;
+         g_remote.wheelSteps = 0;
++        g_remote.sensorGravityValid = false;
+         g_remote.peakAccelValid = false;
+-        g_remote.controllerR = Mat3{};
+-        g_remote.gyroBias = {};
+-        g_remote.gyroBiasValid = false;
+         if (in.window) SDL_SetWindowRelativeMouseMode(in.window, false);
+     }
+     if (pad && in.focused) {
+@@ -307,15 +296,8 @@
+             SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3) &&
+             std::isfinite(gyro[0]) && std::isfinite(gyro[1]) && std::isfinite(gyro[2]) &&
+             std::max({std::fabs(gyro[0]), std::fabs(gyro[1]), std::fabs(gyro[2])}) < 30.0f) {
+-            // Flat-pad axes are rotated into the upright remote frame, then
+-            // mirrored horizontally for the game's turn direction. Angular
+-            // velocity is an axial vector, so its mirror signs differ from
+-            // the accelerometer's below.
+-            const auto pointerDeadzone = [](float value) {
+-                return std::fabs(value) < 0.025f ? 0.0 : static_cast<double>(value);
+-            };
+-            in.gyro = {pointerDeadzone(gyro[0]), pointerDeadzone(gyro[1]), pointerDeadzone(gyro[2])};
+-            in.motionGyro = {gyro[0], -gyro[2], gyro[1]};
++            const auto deadzone = [](float value) { return std::fabs(value) < 0.025f ? 0.0 : static_cast<double>(value); };
++            in.gyro = {deadzone(gyro[0]), deadzone(gyro[1]), deadzone(gyro[2])};
+         }
+         if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+             if (g_remote.accelEnabledFor != padId && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
+@@ -327,12 +309,16 @@
+                 // A DualSense is normally held face-up: its +Z is the Wii
+                 // Remote's button-face +Y, and its +Y points along the
+                 // remote's -Z. SDL acceleration points opposite gravity.
+-                in.acc = {acc[0] / kGravity, -acc[2] / kGravity, acc[1] / kGravity};
++                in.acc = {-acc[0] / kGravity, -acc[2] / kGravity, acc[1] / kGravity};
+                 in.accValid = Len(in.acc) > 0.2 && Len(in.acc) < 5.0;
+             }
+         }
+-        in.peakAcc = g_remote.peakAccel;
+-        in.peakAccValid = g_remote.peakAccelValid;
++        if (g_remote.peakAccelValid && g_remote.sensorGravityValid &&
++            (!in.accValid || Len(g_remote.peakAccel - g_remote.sensorGravity) >
++                                 Len(in.acc - g_remote.sensorGravity))) {
++            in.acc = g_remote.peakAccel;
++            in.accValid = true;
++        }
+         g_remote.peakAccelValid = false;
+         const auto button = [&](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
+         if (button(SDL_GAMEPAD_BUTTON_SOUTH)) in.hold |= kBtnA;
+@@ -386,40 +372,17 @@
+     const uint32_t n = std::clamp<uint32_t>(static_cast<uint32_t>(std::lround(dt * kSampleHz)), 1u, maxSamples);
+ 
+     HostInput in = ReadHost();
+-    const bool bowlingScene = in.controller && ResortBowlingStageActive();
+-    if (bowlingScene != r.bowlingScene) {
+-        r.bowlingScene = bowlingScene;
+-        r.controllerR = r.prevR = Mat3{};
+-        r.prevGyro = r.angle = r.gyroBias = {};
+-        r.gyroBiasValid = false;
+-    }
+-    if (bowlingScene) {
+-        // Bowling's arm swing uses the opposite vertical sense to the other
+-        // sports. Reflect the pitch and its accelerometer gravity component.
+-        in.motionGyro.x = -in.motionGyro.x;
+-        if (in.accValid) in.acc.z = -in.acc.z;
+-        if (in.peakAccValid) in.peakAcc.z = -in.peakAcc.z;
+-    }
+-    Mat3 controllerStart = r.controllerR;
+-    Vec3 controllerRate{}, correctionRate{};
+-    if (in.controller) {
+-        if (in.recenter) {
+-            controllerStart = r.controllerR = r.prevR = Mat3{};
+-            r.prevGyro = r.angle = {};
+-        }
+-        const bool quiet = in.accValid && std::fabs(Len(in.acc) - 1.0) < 0.12 && Len(in.motionGyro) < 0.12;
+-        if (quiet) {
+-            const double k = r.gyroBiasValid ? 1.0 - std::exp(-dt / 2.0) : 1.0;
+-            r.gyroBias = r.gyroBias + (in.motionGyro - r.gyroBias) * k;
+-            r.gyroBiasValid = true;
+-        }
+-        controllerRate = in.motionGyro - r.gyroBias;
+-        if (quiet && Len(controllerRate) < 0.015) controllerRate = {};
+-        // Gravity can correct tilt while the pad is still; never use it to
+-        // damp a live swing. Yaw is intentionally left to the gyro/recenter.
+-        if (in.accValid && Len(controllerRate) < 0.3 && std::fabs(Len(in.acc) - 1.0) < 0.12) {
+-            const Vec3 expected = Apply(Transpose(controllerStart), Vec3{0, -1, 0});
+-            correctionRate = Cross(in.acc * (1.0 / Len(in.acc)), expected) * 1.5;
++    Vec3 physicalMotion{};
++    if (in.controller && in.accValid) {
++        if (!r.sensorGravityValid) {
++            r.sensorGravity = in.acc;
++            r.sensorGravityValid = true;
++        }
++        physicalMotion = in.acc - r.sensorGravity;
++        // Only follow quiet posture changes. A swing must remain a transient
++        // acceleration rather than being absorbed into the gravity baseline.
++        if (Len(physicalMotion) < 0.35 && Len(in.gyro) < 0.4) {
++            r.sensorGravity = r.sensorGravity + physicalMotion * std::min(dt / 0.5, 1.0);
+         }
+     }
+ 
+@@ -430,8 +393,9 @@
+     if (in.recenter) endYaw = endPitch = endRoll = 0;
+ 
+     if (in.focused && in.controller) {
+-        // Keep the original DualSense pointer behavior independent of the
+-        // game's MotionPlus axes. It was already working for IR aiming.
++        // SDL reports pitch, yaw and roll in radians per second in the pad's
++        // body frame. Integrate them into the same orientation used by the
++        // virtual remote's pointer, accelerometer and MotionPlus fields.
+         endPitch += in.gyro.x * dt;
+         endYaw -= in.gyro.y * dt;
+         endRoll -= in.gyro.z * dt;
+@@ -492,10 +456,9 @@
+         const double yaw = startYaw + std::remainder(endYaw - startYaw, 2 * kPi) * t;
+         const double pitch = startPitch + (endPitch - startPitch) * t;
+         const double roll = startRoll + std::remainder(endRoll - startRoll, 2 * kPi) * t;
+-        s.R = in.controller ? Mul(controllerStart, RotVector((controllerRate + correctionRate) * (sdt * (i + 1))))
+-                            : Orientation(yaw, pitch, roll);
++        s.R = Orientation(yaw, pitch, roll);
+         s.roll = roll;
+-        s.gyro = in.controller ? controllerRate : AngularVelocity(r.prevR, s.R, sdt);
++        s.gyro = AngularVelocity(r.prevR, s.R, sdt);
+         r.simTime += sdt;
+ 
+         // Accelerometer: gravity direction in the remote frame, minus the motion of the tip (lever along -Z).
+@@ -504,13 +467,10 @@
+         const Vec3 aLin = Cross(alpha, lever) + Cross(s.gyro, Cross(s.gyro, lever));
+         s.acc = Apply(Transpose(s.R), Vec3{0, -1, 0}) - aLin * (1.0 / kGravity);
+         if (in.controller && in.accValid) {
+-            // Subtract this pose's predicted gravity, not a fixed gravity
+-            // baseline: holding a tilted controller must not look like a swing.
+-            const Vec3 predicted = Apply(Transpose(s.R), Vec3{0, -1, 0});
+-            Vec3 motion = in.acc - predicted;
+-            if (in.peakAccValid && Len(in.peakAcc - predicted) > Len(motion))
+-                motion = in.peakAcc - predicted;
+-            s.acc = s.acc + motion * 2.0;
++            // The pad sensor sits near the hands; the Wii Remote accelerometer
++            // is farther from the grip. Keep the simulated gravity/rotation
++            // and add amplified linear motion from the physical sensor.
++            s.acc = s.acc + physicalMotion * 2.0;
+         }
+         if (r.shakeStart >= 0) {
+             const double ph = 2 * kPi * kShakeHz * (r.simTime - r.shakeStart);
+@@ -518,8 +478,7 @@
+         }
+ 
+         // Pointer: where the aim ray crosses the screen plane.
+-        const Mat3 pointerR = in.controller ? Orientation(yaw, pitch, roll) : s.R;
+-        const Vec3 fwd = Column(pointerR, 2) * -1.0;
++        const Vec3 fwd = Column(s.R, 2) * -1.0;
+         if (fwd.z < -0.2) {
+             const double ax = std::atan2(fwd.x, -fwd.z), ay = std::atan2(fwd.y, -fwd.z);
+             s.posX = std::tan(ax) / std::tan(kHalfFovX);
+@@ -534,7 +493,6 @@
+     r.yaw = endYaw;
+     r.pitch = endPitch;
+     r.roll = endRoll;
+-    if (in.controller) r.controllerR = gen[n - 1].R;
+     for (uint32_t i = 0; i < n; ++i) r.recent[i] = gen[n - 1 - i];
+     r.recentCount = n;
+     return n;
+@@ -588,12 +546,14 @@
+ 
+     if (mpls) {
+         const Conventions& c = r.conv;
+-        const Vec3 g{s.gyro.x * c.gyro[0], s.gyro.y * c.gyro[1], s.gyro.z * c.gyro[2]};
++        const Vec3 rate = ToWii(s.gyro);
++        const Vec3 angle = ToWii(r.angle);
++        const Vec3 g{rate.x * c.gyro[0], rate.y * c.gyro[1], rate.z * c.gyro[2]};
+         WriteVec3(a + guest::kMpls, g * (1.0 / kMplsUnitRadPerSec));
+-        WriteVec3(a + guest::kMplsAngle, Vec3{r.angle.x * c.gyro[0], r.angle.y * c.gyro[1], r.angle.z * c.gyro[2]});
+-        WriteVec3(a + guest::kMplsDirX, Column(s.R, 0) * c.dir);
+-        WriteVec3(a + guest::kMplsDirY, Column(s.R, 1) * c.dir);
+-        WriteVec3(a + guest::kMplsDirZ, Column(s.R, 2) * c.dir);
++        WriteVec3(a + guest::kMplsAngle, Vec3{angle.x * c.gyro[0], angle.y * c.gyro[1], angle.z * c.gyro[2]});
++        WriteVec3(a + guest::kMplsDirX, WiiDir(s.R, 0) * c.dir);
++        WriteVec3(a + guest::kMplsDirY, WiiDir(s.R, 1) * c.dir);
++        WriteVec3(a + guest::kMplsDirZ, WiiDir(s.R, 2) * c.dir);
+     }
+ }
+ 
+@@ -650,14 +610,14 @@
+ 
+ void HandleSdlEvent(const SDL_Event& ev) {
+     if (ev.type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE && ev.gsensor.which == g_remote.activeGamepad &&
+-        ev.gsensor.sensor == SDL_SENSOR_ACCEL &&
++        ev.gsensor.sensor == SDL_SENSOR_ACCEL && g_remote.sensorGravityValid &&
+         !InputBindings::InputBlocked()) {
+         const float* a = ev.gsensor.data;
+         if (std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2])) {
+-            const Vec3 mapped{a[0] / kGravity, -a[2] / kGravity, a[1] / kGravity};
++            const Vec3 mapped{-a[0] / kGravity, -a[2] / kGravity, a[1] / kGravity};
+             if (Len(mapped) > 0.2 && Len(mapped) < 5.0 &&
+                 (!g_remote.peakAccelValid ||
+-                 std::fabs(Len(mapped) - 1.0) > std::fabs(Len(g_remote.peakAccel) - 1.0))) {
++                 Len(mapped - g_remote.sensorGravity) > Len(g_remote.peakAccel - g_remote.sensorGravity))) {
+                 g_remote.peakAccel = mapped;
+                 g_remote.peakAccelValid = true;
+             }
+--- a/src/hle/storage/dvd.cpp
++++ b/src/hle/storage/dvd.cpp
+@@ -20,7 +20,6 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <algorithm>
+-#include <atomic>
+ #include <vector>
+ #include <string>
+ #include <map>
+@@ -96,13 +95,6 @@
+ static std::vector<FstFileEntry> g_fstFiles;
+ static bool g_fstLoaded = false;
+ static std::unordered_set<std::string> g_loggedReadErrors;
+-static std::atomic<bool> g_bowlingStageActive{false};
+-extern "C" bool ResortBowlingStageActive() { return g_bowlingStageActive.load(std::memory_order_relaxed); }
+-static void NoteLoadedStage(const std::string& path) {
+-    if (path.rfind("/Stage/", 0) == 0 && path.find("Scene/") != std::string::npos)
+-        g_bowlingStageActive.store(path.rfind("/Stage/BwlScene/", 0) == 0,
+-                                   std::memory_order_relaxed);
+-}
+ static constexpr int32_t kDvdFatalError = -3;
+ 
+ extern "C" void DVDInit_8009B160();
+@@ -393,8 +385,6 @@
+     }
+ 
+     const DVDFileEntry& entry = g_fileEntries[extent->entryIndex];
+-
+-    NoteLoadedStage(entry.dvdPath);
+     const uint32_t fileOffset = static_cast<uint32_t>(effectiveOffset - extent->startBytes);
+     uint32_t readLength = length;
+     if (readLength == 0 || fileOffset + readLength > entry.size) {
+@@ -886,7 +876,6 @@
+     }
+ 
+     const DVDFileEntry& entry = g_fileEntries[extent->entryIndex];
+-    NoteLoadedStage(entry.dvdPath);
+ 
+     if (offset < 0 || length < 0) {
+         return DvdReadFatal(fileInfoPtr, HostPathText(entry.hostPath), offset,
+@@ -1128,3 +1117,4 @@
+ 
+ extern "C" int32_t DVDLowClearCoverInterrupt_800A35C0(uint32_t cb) { return 1; }
+ PPC_NATIVE_OVERRIDE(800A35C0, DVDLowClearCoverInterrupt_800A35C0, int32_t, (uint32_t cb), (cb));
++

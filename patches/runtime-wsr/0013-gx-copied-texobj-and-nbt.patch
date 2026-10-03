@@ -1,0 +1,67 @@
+diff -ruN a/src/hle/gx/gx_texture.cpp b/src/hle/gx/gx_texture.cpp
+--- a/src/hle/gx/gx_texture.cpp
++++ b/src/hle/gx/gx_texture.cpp
+@@ -306,10 +306,12 @@
+ PPC_NATIVE_OVERRIDE_VOID(80037240, GX__InitTexObjCI_80037240, (uint32_t oa, uint32_t da, uint32_t w, uint32_t h, uint32_t f, uint32_t ws, uint32_t wt, uint32_t m, uint32_t tl), (oa, da, w, h, f, ws, wt, m, tl));
+ 
+ extern "C" void GX__InitTexObjLOD_80037290(uint32_t oa, uint32_t mif, uint32_t maf, float mil, float mal, float lb, uint32_t bc, uint32_t el, uint32_t ma) {
+-    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = GetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
++    std::lock_guard<std::mutex> guard(g_texObjMutex); GXTexObj* obj = TryGetHostTexObj(oa); TexObjMeta& meta = GetTexObjMeta(oa);
+     float fmal = std::isfinite(mal) && mal >= 0.f ? mal : 0.f, fmil = std::isfinite(mil) && mil >= 0.f ? std::min(mil, fmal) : 0.f;
+     meta.minFilter=mif; meta.magFilter=maf; meta.minLod=fmil; meta.maxLod=fmal; meta.lodBias=lb; meta.biasClamp=(bc!=0); meta.edgeLod=(el!=0); meta.maxAniso=ma;
+-    GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
++    // A copied guest GXTexObj may have no host object yet. Keep its guest state
++    // coherent and let GXLoadTexObj construct the host image on first use.
++    if (obj) GXInitTexObjLOD(obj, (GXTexFilter)mif, (GXTexFilter)maf, fmil, fmal, lb, (GXBool)bc, (GXBool)el, (GXAnisotropy)ma);
+     // Also write LOD info to guest memory
+     WriteGuestTexObjLOD(oa, mif, maf, fmil, fmal, lb, bc != 0, el != 0, ma);
+ }
+@@ -317,7 +319,7 @@
+ 
+ extern "C" void GX__InitTexObjWrapMode_800373b0(uint32_t oa, uint32_t ws, uint32_t wt) {
+     std::lock_guard<std::mutex> guard(g_texObjMutex);
+-    GXTexObj* obj = GetHostTexObj(oa);
++    GXTexObj* obj = TryGetHostTexObj(oa);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.wrapS = ws;
+     meta.wrapT = wt;
+@@ -327,16 +329,16 @@
+         Memory::Write32(oa + 0x00, word0);
+     } catch (...) {
+     }
+-    GXInitTexObjWrapMode(obj, (GXTexWrapMode)ws, (GXTexWrapMode)wt);
++    if (obj) GXInitTexObjWrapMode(obj, (GXTexWrapMode)ws, (GXTexWrapMode)wt);
+ }
+ PPC_NATIVE_OVERRIDE_VOID(800373b0, GX__InitTexObjWrapMode_800373b0, (uint32_t oa, uint32_t ws, uint32_t wt), (oa, ws, wt));
+ 
+ extern "C" void GX__InitTexObjTlut_800373d0(uint32_t oa, uint32_t tl) {
+     std::lock_guard<std::mutex> guard(g_texObjMutex);
+-    GXTexObj* obj = GetHostTexObj(oa);
++    GXTexObj* obj = TryGetHostTexObj(oa);
+     TexObjMeta& meta = GetTexObjMeta(oa);
+     meta.tlut = tl;
+-    GXInitTexObjTlut(obj, tl);
++    if (obj) GXInitTexObjTlut(obj, tl);
+     // Keep guest GXTexObj coherent for later GXLoadTexObj from memory.
+     try {
+         Memory::Write32(oa + 0x18, tl);
+diff -ruN a/src/hle/gx/gx_fifo.cpp b/src/hle/gx/gx_fifo.cpp
+--- a/src/hle/gx/gx_fifo.cpp
++++ b/src/hle/gx/gx_fifo.cpp
+@@ -37,11 +37,11 @@
+ }
+ 
+ static void ApplyAuroraVtxStateForRawBegin(GXVtxFmt fmt) {
+-    // KNOWN DIVERGENCE: this is the only publish site with includeNbt=true, so it also
+-    // publishes GX_VA_NBT after GX_VA_NRM, which makes aurora's SETVAT fall-through clobber the
+-    // NRM VAT with the default. Raw-FIFO geometry renders correctly with it; do not "fix" without
+-    // an in-race A/B run.
+-    PublishAuroraVtxState(fmt, AuroraVtxPublishOptions{/*includeNbt=*/true,
++    // GX_VA_NBT is an alias of GX_VA_NRM, not an independent CP attribute.
++    // Publishing it after NRM overwrites the normal VAT with NBT's default
++    // format, which can turn a later normal draw into an invalid GX_RGBA8
++    // component-type decode in Aurora.
++    PublishAuroraVtxState(fmt, AuroraVtxPublishOptions{/*includeNbt=*/false,
+                                                        /*fmtLoopFirst=*/0,
+                                                        /*fmtLoopLast=*/25});
+ }

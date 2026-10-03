@@ -1,0 +1,53 @@
+diff --git a/aurora-main/lib/gx/command_processor.cpp b/aurora-main/lib/gx/command_processor.cpp
+index d94f26c..0fa21ca 100644
+--- a/aurora-main/lib/gx/command_processor.cpp
++++ b/aurora-main/lib/gx/command_processor.cpp
+@@ -304,13 +304,12 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+     // Position matrices (0x0000 - 0x0077)
+     u32 mtxIdx = addr / 12;
+     u32 startOffset = addr % 12;
+-    // We only support full writes to matrices
+     XF_REQUIRE(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob; mtxIdx={}", mtxIdx);
+-    XF_REQUIRE(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
++    XF_REQUIRE(len <= 12 - startOffset, "XF: PosMtx copy crosses matrix: offs={}, len={}", startOffset, len);
+     auto& mtx = g_gxState.pnMtx[mtxIdx].pos;
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+-      flat[i] = read_f32(data + i * 4, bigEndian);
++      flat[startOffset + i] = read_f32(data + i * 4, bigEndian);
+     }
+     g_gxState.stateDirty = true;
+     return true;
+@@ -320,14 +319,13 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+     u32 mtxIdx = texBase / 12;
+     u32 startOffset = texBase % 12;
+     XF_REQUIRE(mtxIdx < MaxTexMtx, "XF TexMtx copy oob; mtxIdx={}", mtxIdx);
+-    XF_REQUIRE(startOffset == 0 && (len == 8 || len == 12), "XF TexMtx sub-copy unsupported: offs={}, len={}",
+-               startOffset, len);
++    XF_REQUIRE(len <= 12 - startOffset, "XF TexMtx copy crosses matrix: offs={}, len={}", startOffset, len);
+ 
+     // Determine if 2x4 or 3x4 from count
+     auto& mtx = g_gxState.texMtxs[mtxIdx];
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+-      flat[i] = read_f32(data + i * 4, bigEndian);
++      flat[startOffset + i] = read_f32(data + i * 4, bigEndian);
+     }
+     g_gxState.stateDirty = true;
+     return true;
+@@ -336,13 +334,12 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+     u32 nrmBase = addr - 0x400;
+     u32 mtxIdx = nrmBase / 9;
+     u32 startOffset = nrmBase % 9;
+-    // We only support full writes to matrices
+     XF_REQUIRE(mtxIdx < MaxPnMtx, "XF: NrmMtx copy oob; mtxIdx={}", mtxIdx);
+-    XF_REQUIRE(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
++    XF_REQUIRE(len <= 9 - startOffset, "XF: NrmMtx copy crosses matrix: offs={}, len={}", startOffset, len);
+     auto& mtx = g_gxState.pnMtx[mtxIdx].nrm;
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+-      u32 xfIdx = i;
++      u32 xfIdx = startOffset + i;
+       u32 row = xfIdx / 3;
+       u32 col = xfIdx % 3;
+       if (row < 3) {

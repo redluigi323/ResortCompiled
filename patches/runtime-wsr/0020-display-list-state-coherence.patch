@@ -1,0 +1,260 @@
+--- a/src/hle/gx/gx_dl.cpp
++++ b/src/hle/gx/gx_dl.cpp
+@@ -58,7 +58,7 @@
+ 
+ static void ApplyAuroraVtxDesc();
+ static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed);
+-static void SyncAppliedVtxStateFromHleReal();
++static void InvalidateAppliedVtxState();
+ static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes);
+ 
+ static inline uint8_t ScaleLytAlpha(uint8_t alpha, uint32_t modulate) {
+@@ -200,7 +200,7 @@
+     }
+     GXMarkFrameWork();
+ 
+-    SyncAppliedVtxStateFromHleReal();
++    InvalidateAppliedVtxState();
+     return true;
+ }
+ 
+@@ -791,21 +791,18 @@
+ 
+     bool OnNop(uint8_t) { return true; }
+     bool OnBpReg(const uint8_t*, uint32_t) { return true; }
+-    // An array base/stride write means the list is setting up indexed geometry.
+-    bool OnCpReg(const uint8_t*, uint8_t reg, uint32_t) { return !(reg >= 0xA0 && reg <= 0xBF); }
++    // CP writes must update the HLE mirror too, even in a register-only list.
++    bool OnCpReg(const uint8_t*, uint8_t, uint32_t) { return false; }
+     bool OnXfReg(const uint8_t*, uint32_t) { return true; }
+-    bool OnIndexedXf(const uint8_t*, uint8_t, uint32_t) { return true; }
++    // Indexed XF loads need guest array addresses translated before submission.
++    bool OnIndexedXf(const uint8_t*, uint8_t, uint32_t) { return false; }
+     bool OnInvalidateVertexCache(uint8_t) { return true; }
+     // Draw opcodes reach this too (kHandlesDraw is false): a draw opcode, or a
+     // command byte this walker does not model, both mean "assume it draws".
+     bool OnUnknownCommand(uint8_t) { return false; }
+-    bool OnCallDisplayList(uint32_t addr, uint32_t size, int depth) {
+-        if (addr == 0 || size == 0) return true;
+-        const uint8_t* nested = static_cast<const uint8_t*>(GuestToHostPtr(addr, size));
+-        if (!nested) return false;
+-        DlMayContainDrawVisitor child;
+-        return WalkDisplayList(nested, size, child, depth + 1);
+-    }
++    // Aurora cannot follow guest addresses. Even a register-only child must
++    // go through scan/flatten so its matrices and CP state take effect.
++    bool OnCallDisplayList(uint32_t, uint32_t, int) { return false; }
+ };
+ 
+ static bool DisplayListMayContainDraw(const uint8_t* data, uint32_t nbytes) {
+@@ -1041,7 +1038,7 @@
+ static bool s_appliedVtxDescValid = false;
+ static std::array<GXAttrType, 26> s_appliedVtxDesc{};
+ static std::array<GXAttrType, 26> s_appliedSourceVtxDesc{};
+-static bool s_appliedVtxAttrFmtValid = false;
++static std::array<bool, 8> s_appliedVtxAttrFmtValid{};
+ static VtxAttrFmt s_appliedVtxAttrFmt[8][26]{};
+ 
+ struct AppliedArrayState {
+@@ -1053,43 +1050,21 @@
+ 
+ static std::array<AppliedArrayState, GX_VA_MAX_ATTR> s_appliedArrays{};
+ 
+-// True only while the applied-state mirror is a verbatim copy of HLE vertex state at
+-// generation s_appliedVtxStateGeneration; any HLE-side mutation bumps that generation, so the
+-// memoized republish below can never observe a stale match.
+-static bool s_appliedVtxStateMatchesHle = false;
+-static uint32_t s_appliedVtxStateGeneration = 0;
+-
+ static void InvalidateAppliedAuroraState() {
+     s_appliedVtxDescValid = false;
+-    s_appliedVtxAttrFmtValid = false;
+-    s_appliedVtxStateMatchesHle = false;
++    s_appliedVtxAttrFmtValid.fill(false);
+     for (auto& array : s_appliedArrays) {
+         array.valid = false;
+     }
+ }
+ 
+-static void SyncAppliedVtxStateFromHleReal() {
+-    // skip the republish only when the mirror is already an exact copy of
+-    // HLE state
+-    if (s_appliedVtxStateMatchesHle && s_appliedVtxDescValid && s_appliedVtxAttrFmtValid &&
+-        s_appliedVtxStateGeneration == g_hleGxState.vtxStateGeneration) {
+-        return;
+-    }
+-    // Both mirrors are dense arrays of the same trivially copyable element types
+-    // as their HLE counterparts, so publish them with three memcpys instead of
+-    // 234 individual element assignments.
+-    static_assert(sizeof(s_appliedVtxDesc) == sizeof(g_hleGxState.vtxDesc));
+-    static_assert(sizeof(s_appliedSourceVtxDesc) == sizeof(g_hleGxState.vtxDesc));
+-    static_assert(sizeof(s_appliedVtxAttrFmt) == sizeof(g_hleGxState.vtxAttrFmt));
+-    std::memcpy(s_appliedVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(g_hleGxState.vtxDesc));
+-    std::memcpy(s_appliedSourceVtxDesc.data(), g_hleGxState.vtxDesc, sizeof(g_hleGxState.vtxDesc));
+-    s_appliedVtxDescValid = true;
+-
+-    std::memcpy(s_appliedVtxAttrFmt, g_hleGxState.vtxAttrFmt, sizeof(g_hleGxState.vtxAttrFmt));
+-    s_appliedVtxAttrFmtValid = true;
+-
+-    s_appliedVtxStateMatchesHle = true;
+-    s_appliedVtxStateGeneration = g_hleGxState.vtxStateGeneration;
++static void InvalidateAppliedVtxState() {
++    // HLE state is the guest's desired state, not proof of the encoder's
++    // current state. Immediate draws expand indexed attributes to direct,
++    // and only the selected VAT row is published for a display-list draw.
++    // Reconcile on the next submission rather than certifying all eight rows.
++    s_appliedVtxDescValid = false;
++    s_appliedVtxAttrFmtValid.fill(false);
+ }
+ 
+ static void ApplyAuroraArrayIfChanged(GXAttr attr, const void* data, uint32_t size, uint8_t stride) {
+@@ -1118,9 +1093,6 @@
+ 
+ static void ApplyAuroraVtxDesc() {
+     const bool hadValidState = s_appliedVtxDescValid;
+-    if (!hadValidState) {
+-        s_appliedVtxStateMatchesHle = false;
+-    }
+     for (int attr = 0; attr < 26; ++attr) {
+         if (attr == GX_VA_NBT) continue;
+         const GXAttr gxAttr = static_cast<GXAttr>(attr);
+@@ -1155,13 +1127,7 @@
+ }
+ 
+ static void ApplyAuroraVtxAttrFmt(GXVtxFmt fmt) {
+-    const bool hadValidState = s_appliedVtxAttrFmtValid;
+-    // Rows other than `fmt` keep their contents and every write below copies
+-    // g_hleGxState, so an already-matching mirror still matches. Only the rebuild
+-    // from an invalidated mirror leaves the untouched rows divergent.
+-    if (!hadValidState) {
+-        s_appliedVtxStateMatchesHle = false;
+-    }
++    const bool hadValidState = s_appliedVtxAttrFmtValid[fmt];
+     for (int attr = 0; attr < 26; ++attr) {
+         if (attr == GX_VA_NBT) continue;
+         if (IsMatrixIndexAttr(static_cast<GXAttr>(attr))) continue;
+@@ -1172,7 +1138,7 @@
+         GXSetVtxAttrFmt(fmt, static_cast<GXAttr>(attr), f.cnt, f.type, f.frac);
+         s_appliedVtxAttrFmt[fmt][attr] = f;
+     }
+-    s_appliedVtxAttrFmtValid = true;
++    s_appliedVtxAttrFmtValid[fmt] = true;
+ }
+ 
+ static void ApplyAuroraVtxAttrFmtAll() {
+@@ -1200,7 +1166,7 @@
+ 
+     GXCallDisplayList(packet, packetBytes);
+     GXMarkFrameWork();
+-    SyncAppliedVtxStateFromHleReal();
++    InvalidateAppliedVtxState();
+ }
+ 
+ static bool ApplyAuroraArraysForDisplayList(const std::array<uint32_t, GX_VA_MAX_ATTR>& maxIdx,
+@@ -1313,11 +1279,8 @@
+             EnsureAuroraFrameActive();
+             GXMarkFrameWork();
+             GXCallDisplayList(list, nbytes);
+-            // The republish is required even for register-only lists (verified by
+-            // experiment: dropping it corrupts in-race geometry decode). It is
+-            // instead memoized inside SyncAppliedVtxStateFromHleReal, so a run of
+-            // register-only lists between draws pays for at most one mirror copy.
+-            SyncAppliedVtxStateFromHleReal();
++            // A raw register stream does not certify the cached vertex layout.
++            InvalidateAppliedVtxState();
+             return;
+         }
+         std::array<uint32_t, GX_VA_MAX_ATTR> maxIdx{}; std::array<bool, GX_VA_MAX_ATTR> sawIdx{};
+@@ -1446,7 +1409,7 @@
+                 GXMarkFrameWork();
+                 GXCallDisplayList(auroraStream, auroraStreamBytes);
+                 // No flip back to GX_DIRECT here
+-                SyncAppliedVtxStateFromHleReal();
++                InvalidateAppliedVtxState();
+                 return;
+             }
+ 
+@@ -1466,7 +1429,7 @@
+                 GXMarkFrameWork();
+                 GXCallDisplayList(list, nbytes);
+ 
+-                SyncAppliedVtxStateFromHleReal();
++                InvalidateAppliedVtxState();
+                 return;
+             }
+ 
+--- /dev/null
++++ b/tests/resort_gx_display_list_tests.cpp
+@@ -0,0 +1,72 @@
++// Exercise the real HLE display-list bridge without starting a GPU or the game.
++// Only the final Aurora submission is captured; scanning, guest address
++// translation, flattening and encoder state publication run normally.
++#include "hle/gx/gx_internal.h"
++#include <vector>
++#include <cstdio>
++#include <cstdlib>
++namespace aurora::gx::fifo { void init(); }
++static std::vector<unsigned char> submitted;
++static void require(bool ok, const char* label) {
++    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
++}
++extern "C" void __wrap_GXCallDisplayList(const void* p, u32 n) {
++    const auto* b = static_cast<const unsigned char*>(p);
++    submitted.insert(submitted.end(), b, b + n);
++}
++extern "C" int __wrap_main(int, char**) {
++    Memory::Init(Memory::Config::WiiDefaults());
++    aurora::gx::fifo::init();
++    g_auroraFrameActive.store(true);
++    constexpr uint32_t list = 0x81000000, child = 0x81001000;
++    const auto write = [](uint32_t addr, const std::vector<unsigned char>& bytes) {
++        for (unsigned i = 0; i < bytes.size(); ++i) Memory::Write8(addr + i, bytes[i]);
++    };
++    const std::vector<unsigned char> cp{8,0x50,0,0,0x14,0, 8,0x60,0,0,0,2};
++    write(list, cp);
++    GX__CallDisplayList_80039910(list, cp.size());
++    require(g_hleGxState.vtxDesc[GX_VA_POS] == GX_INDEX8 &&
++            g_hleGxState.vtxDesc[GX_VA_NRM] == GX_INDEX8 &&
++            g_hleGxState.vtxDesc[GX_VA_TEX0] == GX_INDEX8,
++            "register-only list updates guest vertex layout");
++
++    const std::vector<unsigned char> xf{0x10,0,0,0,0,0x3f,0x80,0,0};
++    write(child, xf);
++    write(list, {0x40,0x81,0,0x10,0,0,0,0,9});
++    submitted.clear();
++    GX__CallDisplayList_80039910(list, 9);
++    require(submitted == xf, "register-only nested matrix list is inlined");
++    Memory::Write32(child + 5, 0x40000000);
++    submitted.clear();
++    GX__CallDisplayList_80039910(list, 9);
++    require(submitted.size() == 9 && submitted[5] == 0x40,
++            "rewritten nested list is not hidden by outer-list cache");
++
++    // A direct immediate draw may alter Aurora without changing guest HLE
++    // state. The next display-list draw must publish the requested VAT again.
++    g_hleGxState.vtxDesc[GX_VA_NRM] = GX_NONE;
++    g_hleGxState.vtxDesc[GX_VA_TEX0] = GX_NONE;
++    g_hleGxState.vtxAttrFmt[0][GX_VA_POS] = {GX_POS_XYZ,GX_F32,0};
++    g_hleGxState.vtxArray[GX_VA_POS].base = 0x81002000;
++    g_hleGxState.vtxArray[GX_VA_POS].stride = 12;
++    g_hleGxState.InvalidateVtxLayoutHash();
++    write(list, {0x90,0,3,0,1,2});
++    GX__CallDisplayList_80039910(list, 6);
++    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_S16, 4);
++    GX__CallDisplayList_80039910(list, 6);
++    GXCompCnt cnt; GXCompType type; u8 frac;
++    GXGetVtxAttrFmt(GX_VTXFMT0,GX_VA_POS,&cnt,&type,&frac);
++    require(cnt == GX_POS_XYZ && type == GX_F32 && frac == 0,
++            "display-list VAT restored after immediate encoder changes");
++    g_hleGxState.vtxAttrFmt[1][GX_VA_POS] = {GX_POS_XYZ,GX_F32,0};
++    g_hleGxState.InvalidateVtxLayoutHash();
++    write(list, {0x90,0,3,0,1,2, 0x91,0,3,0,1,2});
++    GX__CallDisplayList_80039910(list, 12);
++    GXSetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XY, GX_S16, 4);
++    GX__CallDisplayList_80039910(list, 12);
++    GXGetVtxAttrFmt(GX_VTXFMT1,GX_VA_POS,&cnt,&type,&frac);
++    require(cnt == GX_POS_XYZ && type == GX_F32 && frac == 0,
++            "mixed-format list restores every VAT row independently");
++    std::puts("PASS: register state, nested matrices, rewritten children, and vertex-format restoration");
++    return 0;
++}
