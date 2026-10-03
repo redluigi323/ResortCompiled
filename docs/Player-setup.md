@@ -24,6 +24,12 @@ needs their own supported **PAL Wii Sports Resort RZTP01** disc dump, with this
    sudo apt install openssl libxcb-cursor0 libxkbcommon-x11-0 libegl1 libopengl0
    ```
 
+   On Arch Linux:
+
+   ```sh
+   sudo pacman -Syu --needed openssl xcb-util-cursor libxkbcommon-x11 libglvnd
+   ```
+
    Keep your GPU's Vulkan/OpenGL drivers installed. Python and Qt are bundled;
    players do not need the compiler or development environment.
 3. Run `./ResortLauncher` from the extracted `ResortLauncher` folder.
