@@ -5,6 +5,7 @@ No game/system artwork is transferred. Session saves never replace personal save
 """
 from __future__ import annotations
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -284,10 +285,20 @@ class OnlineSession:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((address, port))
             listener.listen(1)
-            listener.settimeout(180)
+            # A lobby stays open until the host leaves. Poll only so cancellation
+            # is responsive even when closing a listener does not wake accept().
+            listener.settimeout(1)
             self.invitation(invite)
-            self.log(f'Waiting for the invited player on TCP port {port}…')
-            raw, _ = listener.accept()
+            self.log(f'Listening on {address}:{port}. Waiting until you leave the session…')
+            while not self.cancelled.is_set():
+                try:
+                    raw, remote = listener.accept()
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                raise ConnectionAbortedError('Session cancelled.')
+            self.log(f'Incoming connection from {remote[0]}. Checking invitation…')
             self.track(raw)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -312,7 +323,27 @@ class OnlineSession:
             invite = json.loads(base64.urlsafe_b64decode(code))
             if invite.get('v') != VERSION or not 1 <= int(invite['port']) <= 65535:
                 raise ValueError('Invalid session invitation.')
-            raw = self.track(socket.create_connection((address, int(invite['port'])), timeout=20))
+            host_port = int(invite['port'])
+            self.log(f'Connecting to {address}:{host_port}…')
+            try:
+                raw = self.track(socket.create_connection((address, host_port), timeout=20))
+            except OSError as error:
+                if error.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+                    reason = ('No route to host: the operating system could not reach the host, '
+                              'or a firewall rejected the connection. On both PCs, check ZeroTier '
+                              'authorization and assigned addresses; on the guest check '
+                              f'“ip route get {address}” and ping the host. The host firewall '
+                              f'must allow TCP {host_port} from the guest’s ZeroTier address.')
+                elif error.errno == errno.ECONNREFUSED:
+                    reason = ('Connection refused: check that the host lobby is still open, '
+                              'the selected network address and invitation are current, and '
+                              'the host firewall permits this port.')
+                elif isinstance(error, TimeoutError):
+                    reason = ('Connection timed out: check both ZeroTier devices are authorized, '
+                              'the host address is correct, and the host firewall allows this port.')
+                else:
+                    raise
+                raise ConnectionError(f'{reason}\nEndpoint: {address}:{host_port} ({error})') from error
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.minimum_version = ssl.TLSVersion.TLSv1_3
             context.check_hostname = False
