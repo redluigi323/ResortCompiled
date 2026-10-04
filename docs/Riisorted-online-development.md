@@ -15,9 +15,9 @@ the game's menus or create new multiplayer sports.
 
 Both players need the same newly built native executable, extracted game content,
 Riisorted overlays, and Mii artwork. Different personal Mii collections are allowed.
-Existing installed copies must receive the new `out/Resortcompiled` executable in
-their `Runtime/Resortcompiled` directory, or use a newly packaged runtime. The
-launcher rejects old runtimes before starting a session.
+Launcher preview 0.2.2 and newer installs its bundled runtime when opening or
+locating an existing installation, preserving UserData. For the development CLI,
+use the latest built portable `out` folder. The bridge rejects unsupported old runtimes.
 
 1. Select **Riisorted**, then **Online play · Experimental**.
 2. Host chooses **Host a session**, selects a TCP port (default **42680**), and
