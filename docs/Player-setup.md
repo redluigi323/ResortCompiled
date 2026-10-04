@@ -37,13 +37,17 @@ needs their own supported **PAL Wii Sports Resort RZTP01** disc dump, with this
    it, then prepares the game. A complete disc provides Mii face artwork. A
    scrubbed disc may require **Set up face artwork** with your complete dump.
 5. Create Miis in the launcher or optionally import your existing collection.
-6. Select **Riisorted**. Do not use an old installed runtime for this test: use
-   a fresh installation of this package. Existing saves can be imported later.
+6. Select **Riisorted**. Fresh installs include the native runtime in
+   `Resort/Runtime`, next to the extracted `Resort/Game` folder. Starting with
+   preview **0.2.2**, reopening or locating an existing installation automatically
+   installs this launcher's bundled runtime when its files are outdated or missing.
+   Saves, Miis and settings in `Runtime/UserData` are preserved. Wait for runtime
+   setup to finish before playing. No development checkout or compilation is needed.
 
 ## Connect the two PCs with ZeroTier
 
 ZeroTier supplies a virtual LAN; Riisorted still exchanges its own encrypted
-two-player input stream. 
+two-player input stream. No Epic Online Services account is used.
 
 Follow ZeroTier's official [installation and quickstart guide](https://docs.zerotier.com/quickstart/).
 Install ZeroTier One on both PCs. One player creates a **private** network in
@@ -114,6 +118,7 @@ controllers used, and what each screen did.
   separately compiling the same sources may produce different executable hashes.
 - **Mii conflict or collection full:** select fewer guest Miis, or resolve duplicate
   identities in the creator before joining. The collection holds 100 Miis.
-- **Older runtime:** make a fresh installation from this preview package.
+- **Older runtime:** use the 0.2.2 or newer launcher and locate the installation;
+  runtime setup repairs it automatically. The earlier launchers need a fresh install.
 
 For developer CLI commands, see [online development](Riisorted-online-development.md).
