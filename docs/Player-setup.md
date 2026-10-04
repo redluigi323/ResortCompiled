@@ -74,10 +74,15 @@ sudo ufw allow from GUEST_ZEROTIER_IP to any port 42680 proto tcp
 ## Host and join
 
 **Host:** open **Riisorted → Online play · Experimental → Host a session**.
+Select your **ZeroTier device and managed IPv4 address** in **Host network**
+(use **Refresh** if you just connected ZeroTier). Loopback is only for same-PC
+tests; **All networks** listens everywhere but is not an address to share.
 Keep port **42680**, start, and wait for the invitation. Send the invitation and
 your **ZeroTier managed IP** privately to the guest. Content hashing can take time;
 the invitation is generated when the host is ready. Start after both PCs have
 finished installing and joining ZeroTier.
+The host lobby stays open until you choose **Leave session**; there is no waiting
+timer. Setup and gameplay connection timeouts still detect stalled peers.
 
 **Guest:** open **Online play → Join a session**, paste the invitation, enter the
 host's ZeroTier IP, choose the Miis to bring, and join. Do not enter `127.0.0.1`:
@@ -111,8 +116,23 @@ controllers used, and what each screen did.
 ### Common setup errors
 
 - **Connection timeout:** check authorization, managed IP, host firewall, and
-  that host is waiting with a current invitation. A host invitation expires when
-  its lobby stops; start again if it timed out.
+  that host is waiting with a current invitation. Invitations become invalid
+  when their lobby stops; use the new invitation after restarting a host.
+- **No route to host:** the OS could not reach the endpoint, or a firewall rejected
+  it. Being joined to the same ZeroTier network alone does not prove connectivity.
+  On both PCs, run `sudo zerotier-cli listnetworks` and confirm the same network
+  has status `OK` and an assigned IPv4 address. On the guest, run
+  `ip route get HOST_ZEROTIER_IP` and confirm the route uses the ZeroTier device,
+  then `ping -c 4 HOST_ZEROTIER_IP`. Check the return route on the host with
+  `ip route get GUEST_ZEROTIER_IP`. While the host lobby is open,
+  `ss -ltn 'sport = :42680'` on the host should show a listening socket.
+  If available, `nc -vz -w 5 HOST_ZEROTIER_IP 42680` on the guest checks TCP
+  connectivity, but **it consumes the current lobby connection**: restart the
+  host afterward and share its new invitation. If ping works but TCP fails,
+  check the host's firewall rules for TCP 42680 from the guest's ZeroTier IP.
+  Ping can itself be blocked, so a failed ping is not proof that TCP is blocked.
+  See ZeroTier's [connection troubleshooting](https://docs.zerotier.com/faq/connectionissues/)
+  and [local firewall guidance](https://docs.zerotier.com/routertips/).
 - **Compatibility mismatch:** use the same archive on both PCs, the same supported
   game revision, and identical overlays. Build hashes are checked exactly;
   separately compiling the same sources may produce different executable hashes.
