@@ -6,6 +6,14 @@ RIISORTED · RESORT LAUNCHER
 4. Install the game, then use Create / manage Miis to make your own Miis.
 5. Choose an edition and press Play.
 
+RUNTIME INSTALLATION
+The launcher installs the native runtime in Resort/Runtime and the disc files in
+Resort/Game. Preview 0.2.2 checks and repairs older/missing runtime files when you
+open or locate an installation and before playing. Runtime/UserData keeps your
+saves, Miis and settings. Previous runtime files remain in .runtime-backup-*.
+The runtime comes from this release package; no source checkout or compiler is
+required. Keep the whole extracted launcher folder, including _internal, together.
+
 SUPPORTED GAME
 PAL Wii Sports Resort, game ID RZTP01.
 The launcher also checks main.dol against this release's supported revision:
