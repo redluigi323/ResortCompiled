@@ -49,15 +49,16 @@ rsync -a "$WC/runtime/third_party" "$WC/runtime/assets" "$TREE/runtime/"
 ln -sfn "$ROOT/work/generated" "$TREE/generated"
 ln -sfn "$WC/aurora-main" "$TREE/aurora-main"
 
-if [[ ! -f "$BUILD/build.ninja" ]]; then
-  echo "==> Configuring (first time downloads aurora's dependencies: Dawn, SDL3, imgui, ...)"
+python3 "$ROOT/scripts/netplay_build_identity.py" --output "$ROOT/work/netplay-simulation-id.txt"
+SIMULATION_ID="$(cat "$ROOT/work/netplay-simulation-id.txt")"
+echo "==> Configuring (first time downloads aurora's dependencies: Dawn, SDL3, imgui, ...)"
   cmake -S "$TREE/runtime" -B "$BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang \
     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+    -DRIISORTED_SIMULATION_ID="$SIMULATION_ID" \
     -DMKW_TRANSLATED_COMPILE_JOBS="$TRANSLATED_JOBS" \
     -DMKW_TRANSLATED_SHARD_MANIFEST="$TREE/generated/build_shards/shards.cmake"
-fi
 [[ $CONFIGURE_ONLY -eq 1 ]] && { echo "Configured."; exit 0; }
 
 echo "==> Building $TARGET with $JOBS jobs ($TRANSLATED_JOBS for translated shards; ${MEM_GB} GB RAM)"

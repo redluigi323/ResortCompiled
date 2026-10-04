@@ -65,12 +65,16 @@ set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
 # asymmetric resume/yield coroutine libraries, which would need every call site restructured).
 # Vendored from upstream (higan-emu/libco @ e18e09d, 2019-10-16, ISC license; valgrind.h is
 # separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers
-# and macOS uses the project's x18-safe AArch64 assembly backend, so this target is Linux-only.
-if(MKW_PLATFORM_LINUX)
+# by default; the explicit experimental rewindable backend also uses libco on
+# Windows x64. macOS retains the project's x18-safe AArch64 assembly backend.
+if(MKW_PLATFORM_LINUX OR MKW_PLATFORM_WINDOWS)
     add_library(mkw_libco STATIC third_party/libco/libco.c)
     add_library(mkw::libco ALIAS mkw_libco)
     target_include_directories(mkw_libco PUBLIC third_party/libco)
     set_target_properties(mkw_libco PROPERTIES UNITY_BUILD OFF)
+    if(MKW_PLATFORM_WINDOWS)
+        target_compile_definitions(mkw_libco PRIVATE NVALGRIND)
+    endif()
 endif()
 
 # Runtime configuration is real TOML, parsed by toml11 rather than a project-
@@ -345,7 +349,8 @@ add_test(NAME mkw_input_expr_tests COMMAND mkw_input_expr_tests)
 if(MKW_PLATFORM_LINUX)
     add_executable(mkw_linux_host_context_tests
         "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp")
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context_rewind.cpp")
     target_include_directories(mkw_linux_host_context_tests PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/include"
         "${CMAKE_CURRENT_LIST_DIR}/third_party/libco")
@@ -367,6 +372,7 @@ if(MKW_PLATFORM_MACOS)
     add_executable(mkw_macos_host_context_tests
         "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context_rewind.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
     target_include_directories(mkw_macos_host_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
     target_compile_features(mkw_macos_host_context_tests PRIVATE cxx_std_17)

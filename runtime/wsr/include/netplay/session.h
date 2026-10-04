@@ -46,7 +46,11 @@ MotionBatch DecodeMotionBatch(const std::vector<uint8_t>& bytes);
 // wall-clock reads and no implicit advancement when the network is waiting.
 class SimulationClock {
 public:
+    struct State { uint64_t ticks, remainder; uint32_t rate; };
     uint64_t Ticks() const noexcept { return ticks_; }
+    State Save() const noexcept { return {ticks_, remainder_, rate_}; }
+    // Deliberate rewind is allowed only through a validated checkpoint.
+    void Restore(State state);
     void AdvanceTo(uint64_t ticks);
     // Exact rational intervals; 60 Hz is 1,012,500 Broadway ticks per interval.
     void AdvanceInterval(uint32_t hz);

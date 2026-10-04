@@ -39,8 +39,9 @@ python3 -m venv .venv-launcher
 
 This does not recompile or launch the game. Linux packaging copies libpng and
 rewrites native library lookup to `$ORIGIN`, so the release does not depend on a
-maintainer's build directory. Native session copies include those adjacent
-libraries. The full Qt/Python launcher, runtime assets, credits, setup docs and
+maintainer's build directory. Online sessions execute that installed runtime
+and its adjacent libraries in place; each session redirects mutable user data
+to its own folder. The full Qt/Python launcher, runtime assets, credits, setup docs and
 source snapshot are included. Disc images, extracted game files, generated game
 translations, private NAND data, caches, logs, invites and developer configuration
 are excluded from the source snapshot and personal data from the payload.
@@ -75,3 +76,8 @@ Suggested release notes:
 
 Gameplay testing remains with the user. Packaging checks are static inspection,
 Python/shell syntax checks, and compilation; they are not match verification.
+
+## Windows cross build from Linux
+
+See [Windows-build.md](Windows-build.md) for LLVM-MinGW native compilation,
+Windows Python packaging under Wine, and including the EOS runtime.

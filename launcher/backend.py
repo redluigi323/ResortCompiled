@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -15,6 +14,8 @@ import uuid
 
 import tomlkit
 from PySide6.QtCore import QThread, Signal
+
+from process_environment import native_library_path
 
 from mii_data import Database, atomic_bytes, database_path, ensure_database
 from mii_resources import recover_resource, validate_resource
@@ -56,22 +57,6 @@ def child_environment() -> dict[str, str]:
     return env
 
 
-@contextmanager
-def native_library_path():
-    # Windows children inherit SetDllDirectory, which PyInstaller points at its
-    # private Qt bundle. Restore normal DLL lookup just while creating a child.
-    frozen_windows = os.name == "nt" and getattr(sys, "frozen", False)
-    if frozen_windows:
-        import ctypes
-        set_directory = ctypes.windll.kernel32.SetDllDirectoryW
-        set_directory.argtypes = [ctypes.c_wchar_p]
-        set_directory.restype = ctypes.c_int
-        set_directory(None)
-    try:
-        yield
-    finally:
-        if frozen_windows:
-            set_directory(str(sys._MEIPASS))
 
 
 def payload_root() -> Path:
@@ -79,7 +64,7 @@ def payload_root() -> Path:
     # the exact same staged payload, prepared by scripts/release/package.py.
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS) / "payload"
-    return Path(__file__).resolve().parent / "payload"
+    return Path(__file__).resolve().parent / ("payload-win32" if sys.platform == "win32" else "payload")
 
 
 def game_executable() -> str:
@@ -142,6 +127,7 @@ def stamp_runtime(runtime: Path, release: dict, files: dict):
     (runtime / 'portable.txt').touch()
     atomic_text(runtime / 'runtime-release.json', json.dumps({
         'version': release['version'], 'runtime_files': files,
+        'netplay_simulation_id': release.get('netplay_simulation_id'),
     }, indent=2))
 
 

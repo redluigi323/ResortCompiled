@@ -5,12 +5,13 @@ import tomllib
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFormLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout)
 from mii_data import Database, name_of
 from netplay import OnlineSession, DB
 from backend import child_environment
+from eos_transport import available as eos_available
 
 
 class SessionWorker(QThread):
@@ -41,10 +42,16 @@ class OnlineDialog(QDialog):
         layout = QVBoxLayout(self)
         title = QLabel('Play together, from anywhere.'); title.setObjectName('cardTitle')
         layout.addWidget(title)
-        copy = QLabel('Experimental two-player direct connection. Both players need the same build and game content. '
+        copy = QLabel('Experimental two-player online play. Both players need the same build and game content. '
                       'Host saves are used in a separate session. Progress stays there while synchronization is being developed.')
         copy.setWordWrap(True); layout.addWidget(copy)
         form = QFormLayout()
+        self.transport = QComboBox()
+        if eos_available(): self.transport.addItem('Epic Online Services · automatic device login', 'eos')
+        self.transport.addItem('Direct connection · LAN / ZeroTier', 'direct')
+        form.addRow('Connection', self.transport)
+        self.relay = QCheckBox('Force Epic relay (for connection testing)')
+        form.addRow(self.relay)
         self.role = QComboBox(); self.role.addItems(['Host a session', 'Join a session'])
         form.addRow('Session', self.role)
         self.network = QComboBox()
@@ -60,8 +67,10 @@ class OnlineDialog(QDialog):
         self.load_networks()
         self.address = QLineEdit(); self.address.setPlaceholderText('Host IP address (when joining)')
         form.addRow('Host address', self.address)
+        self.address_label = form.labelForField(self.address)
         self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(42680)
         form.addRow('Host TCP port', self.port)
+        self.port_label = form.labelForField(self.port)
         self.code = QPlainTextEdit(); self.code.setPlaceholderText('Paste the host invitation when joining')
         self.code.setMaximumHeight(80); form.addRow('Invitation', self.code)
         layout.addLayout(form)
@@ -86,16 +95,22 @@ class OnlineDialog(QDialog):
         self.keep = QPushButton('Keep guest Miis'); self.keep.setEnabled(False); self.keep.clicked.connect(self.keep_miis)
         for widget in (self.start, self.copy, self.keep, self.stop): buttons.addWidget(widget)
         layout.addLayout(buttons)
-        self.role.currentIndexChanged.connect(self.role_changed); self.role_changed()
+        self.role.currentIndexChanged.connect(self.role_changed)
+        self.transport.currentIndexChanged.connect(self.role_changed); self.role_changed()
 
     def role_changed(self):
         joining = self.role.currentIndex() == 1
+        eos = self.transport.currentData() == 'eos'
         self.start.setText('Join session' if joining else 'Host session')
         self.address.setEnabled(joining); self.port.setEnabled(not joining)
         self.code.setReadOnly(not joining)
         self.miis.setVisible(joining); self.mii_label.setVisible(joining)
         for widget in (self.network, self.refresh_network, self.network_label, self.network_note):
-            widget.setVisible(not joining)
+            widget.setVisible(not joining and not eos)
+        for widget in (self.address, self.address_label, self.port, self.port_label): widget.setVisible(not eos)
+        self.relay.setVisible(eos)
+        self.code.setPlaceholderText('Paste the host invitation; no IP address or Epic account needed'
+                                     if eos else 'Paste the host invitation when joining')
 
     def load_networks(self):
         previous = self.network.currentData()
@@ -123,10 +138,14 @@ class OnlineDialog(QDialog):
         address = self.address.text().strip() if role == 'join' else self.network.currentData()
         self.host_address = address
         code = self.code.toPlainText().strip()
-        if role == 'join' and (not address or not code):
-            QMessageBox.information(self, 'Join session', 'Enter the host address and invitation.'); return
+        eos = self.transport.currentData() == 'eos'
+        if role == 'join' and (not code or (not eos and not address)):
+            QMessageBox.information(self, 'Join session', 'Paste the host invitation.' if eos
+                                    else 'Enter the host address and invitation.'); return
         folder = self.sessions / f'{role}-{time.time_ns()}-{uuid.uuid4().hex[:6]}'
         self.engine = OnlineSession(self.runtime, folder)
+        self.engine.transport = self.transport.currentData()
+        self.engine.force_relay = self.relay.isChecked()
         self.engine.environment = child_environment()
         if role == 'join':
             self.engine.selected_slots = [self.miis.item(i).data(Qt.ItemDataRole.UserRole)
@@ -138,10 +157,14 @@ class OnlineDialog(QDialog):
         self.worker.finished.connect(self.done_running)
         for widget in (self.start, self.role, self.address, self.port, self.code, self.miis,
                        self.network, self.refresh_network): widget.setEnabled(False)
+        self.transport.setEnabled(False); self.relay.setEnabled(False)
         self.keep.setEnabled(False); self.stop.setText('Leave session'); self.worker.start()
 
     def show_invitation(self, code):
         self.code.setPlainText(code); self.copy.setEnabled(True)
+        if self.engine.transport == 'eos':
+            self.output.appendPlainText('Share this invitation privately. Your guest needs no IP address or Epic account.')
+            return
         ip = self.host_address
         self.output.appendPlainText(f'Share this invitation and host IP {ip} with the other player.'
             if ip != '0.0.0.0' else 'Share this invitation and your ZeroTier or LAN IP (not 0.0.0.0).')
@@ -149,6 +172,7 @@ class OnlineDialog(QDialog):
     def done_running(self):
         for widget in (self.start, self.role, self.code, self.miis, self.network,
                        self.refresh_network): widget.setEnabled(True)
+        self.transport.setEnabled(True); self.relay.setEnabled(True)
         self.role_changed(); self.stop.setText('Close')
         run = getattr(self.engine, 'run', None)
         self.keep.setEnabled(self.engine.role == 'host' and run is not None and (run / 'UserData/NAND' / DB).exists())

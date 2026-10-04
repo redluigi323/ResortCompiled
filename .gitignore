@@ -25,3 +25,8 @@
 /.agents/
 /.codex/
 /.aws/
+/eosstuff/
+/launcher/eos-local/
+**/eos-client.json
+
+/launcher/payload-win32/

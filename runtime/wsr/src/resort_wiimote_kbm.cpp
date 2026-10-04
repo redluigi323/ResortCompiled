@@ -1,3 +1,4 @@
+#include "netplay/motionplus_report.h"
 // Resortcompiled: virtual Wii Remote with Wii MotionPlus, fed to WSR at the KPAD level.
 //
 // WSR reads its remote through a newer KPAD (MotionPlus-aware) than Mario Kart Wii, so WiiCompiled's MKW
@@ -806,6 +807,29 @@ uint32_t Step(uint32_t maxSamples) {
     return count;
 }
 
+uint32_t OnlineSolverWork(uint32_t channel) {
+    const auto* cpu = TryGetCpuContext();
+    if(!cpu)cpu=&GetPersistentCpuContext();
+    if(!Memory::Contains(cpu->gpr[13]-15184,4))return 0;
+    const auto base=Memory::Read32(cpu->gpr[13]-15184);
+    const auto work=base+channel*3504u;
+    return base && Memory::Contains(work,3504)?work:0;
+}
+std::vector<uint8_t> CaptureOnlineSolverState(uint32_t channel) {
+    const auto work=OnlineSolverWork(channel);std::vector<uint8_t> result;
+    if(!work)return result;
+    result.reserve(Riisorted::Netplay::kMotionPlusStateBytes);
+    for(uint32_t i=0;i<3504;++i)if(i<3488 || i>=3500)result.push_back(Memory::Read8(work+i));
+    return result;
+}
+void RestoreOnlineSolverState(uint32_t channel,const std::vector<uint8_t>& state) {
+    if(state.empty())return;
+    const auto work=OnlineSolverWork(channel);
+    if(!work)throw std::runtime_error("Guest MotionPlus state is not initialized at the host's frame");
+    size_t cursor=0;
+    for(uint32_t i=0;i<3504;++i)if(i<3488 || i>=3500)Memory::Write8(work+i,state[cursor++]);
+}
+
 // Exchange once for both channels even when the game reads channel 1 first.
 void EnsureOnlineFrame() {
     if (!Online::Active() || g_onlineFrame == g_gxFrameCount) return;
@@ -821,6 +845,17 @@ void EnsureOnlineFrame() {
         StepLive(16);
     }
     const auto agreed = Online::Exchange(g_capture, modes, g_previousOnlineSolverHash);
+    Riisorted::Netplay::MotionPlusReport report;
+    report.sequence=g_onlineSequence;report.frame=static_cast<uint64_t>(g_gxFrameCount);report.modes=modes;
+    const bool host=Online::LocalChannel()==0;
+    if(!host) {
+        report=Riisorted::Netplay::DecodeMotionPlusReport(Online::ShareMotionPlusReport());
+        if(report.sequence!=g_onlineSequence || report.frame!=static_cast<uint64_t>(g_gxFrameCount) || report.modes!=modes)
+            throw std::runtime_error("MotionPlus report frame/mode disagreement");
+        for(unsigned channel=0;channel<2;++channel)
+            if(report.samples[channel].size()!=agreed.players[channel].samples.size())
+                throw std::runtime_error("MotionPlus report sample count disagrees with paired raw inputs");
+    }
     g_solverHash = 14695981039346656037ull;
     for (uint32_t channel = 0; channel < 2; ++channel) {
         Remote& remote = g_onlineRemotes[channel];
@@ -835,9 +870,17 @@ void EnsureOnlineFrame() {
             func_800CE180(call.get());
         }
         std::deque<Sample> history;
+        size_t sampleIndex=0;
         for (const auto& input : batch.samples) {
             Sample sample = RestoreMappedSample(input);
-            if (modes[channel]) ProcessMotionPlus(sample, channel);
+            if(host) {
+                if (modes[channel]) ProcessMotionPlus(sample, channel);
+                report.samples[channel].push_back({sample.sdkMpls,sample.mpls});
+            } else {
+                const auto& canonical=report.samples[channel][sampleIndex];
+                sample.sdkMpls=canonical.valid;sample.mpls=canonical.words;
+            }
+            ++sampleIndex;
             AccumulateSolverResult(sample);
             history.push_back(sample);
             if (history.size() > 16) history.pop_front();
@@ -847,7 +890,10 @@ void EnsureOnlineFrame() {
             remote.recent[i] = history[history.size() - 1 - i];
         remote.stepFrame = g_gxFrameCount;
         ++remote.batch;
+        if(host)report.states[channel]=CaptureOnlineSolverState(channel);
+        else RestoreOnlineSolverState(channel,report.states[channel]);
     }
+    if(host)Online::ShareMotionPlusReport(Riisorted::Netplay::EncodeMotionPlusReport(report));
     g_previousOnlineSolverHash = g_solverHash;
     g_onlineFrame = g_gxFrameCount;
     ++g_onlineSequence;

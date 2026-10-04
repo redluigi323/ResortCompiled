@@ -1,5 +1,13 @@
 RIISORTED · RESORT LAUNCHER
 
+EOS TEST BUILDS
+If Epic Online Services is listed in Online play, use it on both PCs. Host and
+share the generated invitation privately; the guest pastes it without an IP.
+Device login is automatic, with no Epic account prompt. Force Epic relay on both
+PCs for a relay connection test. See docs/EOS-netplay.md for details and limits.
+These test builds embed game-client credentials. Keep the archive private during
+initial configuration testing. EOS does not resolve game desynchronization.
+
 1. Extract the complete download to a folder on your computer.
 2. Open ResortLauncher (ResortLauncher.exe on Windows).
 3. Choose your Wii Sports Resort disc image and an installation folder.
@@ -44,22 +52,26 @@ No personal NAND or Nintendo face artwork is included in this package.
 
 EDITIONS
 Wii Sports Resort launches with no Riisorted file overlays.
-Riisorted includes experimental two-player direct online play on Linux x86-64.
+Riisorted includes experimental two-player online play on Linux and Windows x86-64.
 Both editions share offline saves and settings. F10 opens in-game settings.
 
 ONLINE PLAY (EXPERIMENTAL)
-Choose Riisorted, then Online play. Host starts a session and shares the invitation
-and host IP address. Guest enters both and selects Miis to bring. Use identical
-builds/game content; start with local two-player Swordplay Duel. Hosting currently
-requires the system openssl command. Default host TCP port is 42680; internet
-connections require a reachable port. No relay or automatic NAT traversal exists.
+Choose Riisorted, then Online play. In EOS builds, host starts a session and
+shares the invitation privately. Guest pastes it and selects Miis to bring.
+No Epic account sign-in, IP address, ZeroTier or port forwarding is needed for EOS.
+Force relay is available when direct peer connectivity fails.
+Use matching builds and game content on both PCs. Windows/Linux crossplay checks
+a shared simulation identity, while each installation checks its own binary hashes. Start with local two-player Swordplay Duel.
+The optional direct transport uses a reachable TCP port and requires openssl on
+the host; see docs/Player-setup.md for its ZeroTier instructions.
 Host saves and guest Miis initialize separate session data. Online progress stays
 in the session folder; host can choose Keep guest Miis afterward. Personal game
 saves are unchanged. Connection/input checks stop on detected disagreements, but
 complete game synchronization is not guaranteed yet. Higher latency can slow play.
 Session folders and logs are under the launcher's data directory, in Netplay/.
-See docs/Player-setup.md for installing this preview and connecting using ZeroTier.
-This Linux build requires glibc 2.38+ (Mint 22 / Ubuntu 24.04 recommended).
+Linux requires glibc 2.38+ (Mint 22 / Ubuntu 24.04 recommended).
+Windows requires Windows 10/11 x64 and a current graphics driver.
+See docs/EOS-netplay.md and docs/Windows-build.md for build details.
 
 YOUR INSTALLATION
 The selected installation folder contains a Resort directory with:

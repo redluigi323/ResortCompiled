@@ -180,14 +180,14 @@ void WakeGuestThreadsOnQueueNoSwitch(uint32_t queueAddr)
 // GuestFiberManager Implementation
 // =============================================================================
 
-void GuestFiberManager::Initialize() {
+void GuestFiberManager::Initialize(HostContext::Backend backend) {
     std::lock_guard<std::mutex> lock(s_mutex);
     
     if (s_initialized) {
         return;
     }
     
-    if (!HostContext::InitializeScheduler(&s_schedulerFiber)) {
+    if (!HostContext::InitializeScheduler(&s_schedulerFiber, backend)) {
         RT_LOG(RT_TAG_OS) << "FATAL: Failed to initialize scheduler context!" << std::endl;
         ShowRuntimeFatalPopup("guest scheduler initialization failed",
                               "The host could not create the scheduler context required to run guest threads.");
@@ -196,6 +196,52 @@ void GuestFiberManager::Initialize() {
     
     s_currentGuestThread = 0;
     s_initialized = true;
+}
+
+GuestFiberManager::WorkerCheckpoint GuestFiberManager::CaptureSuspendedWorkers() {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!s_initialized || !HostContext::IsCurrent(s_schedulerFiber) || s_currentGuestThread != 0 ||
+        !s_fibersPendingDelete.empty())
+        throw std::logic_error("Worker checkpoint requires a quiescent outer scheduler boundary");
+    WorkerCheckpoint result;
+    for (const auto& [thread, fiber] : s_fibers) {
+        if (fiber.isSchedulerFiber) continue;
+        if (!fiber.fiber || fiber.terminated)
+            throw std::logic_error("Worker checkpoint cannot retain a retired continuation");
+        result.workers.push_back({thread, fiber, HostContext::Capture(fiber.fiber)});
+    }
+    std::sort(result.workers.begin(), result.workers.end(), [](const auto& a, const auto& b) {
+        return a.thread < b.thread;
+    });
+    return result;
+}
+
+void GuestFiberManager::RestoreSuspendedWorkers(const WorkerCheckpoint& checkpoint) {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!s_initialized || !HostContext::IsCurrent(s_schedulerFiber) || s_currentGuestThread != 0 ||
+        !s_fibersPendingDelete.empty())
+        throw std::logic_error("Worker restore requires a quiescent outer scheduler boundary");
+    size_t count = 0;
+    for (const auto& [thread, fiber] : s_fibers) if (!fiber.isSchedulerFiber) ++count;
+    if (count != checkpoint.workers.size()) throw std::logic_error("Worker topology changed since checkpoint");
+    uint32_t previous = 0;
+    for (const auto& worker : checkpoint.workers) {
+        auto found = s_fibers.find(worker.thread);
+        if (!worker.thread || worker.thread <= previous || found == s_fibers.end() ||
+            found->second.isSchedulerFiber || found->second.terminated ||
+            found->second.fiber != worker.metadata.fiber ||
+            found->second.entryPoint != worker.metadata.entryPoint ||
+            found->second.entryArg != worker.metadata.entryArg || worker.metadata.terminated ||
+            worker.metadata.isSchedulerFiber)
+            throw std::logic_error("Worker identity/lifetime changed since checkpoint");
+        HostContext::ValidateRestore(found->second.fiber, worker.continuation);
+        previous = worker.thread;
+    }
+    // Every image and worker is validated before any native stack is written.
+    for (const auto& worker : checkpoint.workers) {
+        HostContext::Restore(worker.metadata.fiber, worker.continuation);
+        s_fibers.at(worker.thread) = worker.metadata;
+    }
 }
 
 void GuestFiberManager::Shutdown() {

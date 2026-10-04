@@ -116,6 +116,13 @@ MotionBatch DecodeMotionBatch(const std::vector<uint8_t>& bytes) {
     return batch;
 }
 
+void SimulationClock::Restore(State state) {
+    if ((!state.rate && state.remainder) || (state.rate && state.remainder >= state.rate))
+        throw std::invalid_argument("Invalid simulation clock checkpoint");
+    ticks_ = state.ticks;
+    remainder_ = state.remainder;
+    rate_ = state.rate;
+}
 void SimulationClock::AdvanceTo(uint64_t ticks) {
     if (ticks < ticks_) throw std::invalid_argument("Simulation time cannot go backwards");
     ticks_ = ticks;
@@ -167,3 +174,46 @@ std::optional<AgreedInputs> LockstepQueue::Take() {
     return result;
 }
 } // namespace Riisorted::Netplay
+
+#include "netplay/motionplus_report.h"
+namespace Riisorted::Netplay {
+std::vector<uint8_t> EncodeMotionPlusReport(const MotionPlusReport& r) {
+    std::vector<uint8_t> out{'D',1};
+    const auto put = [&](uint64_t value, unsigned size) {
+        for (int i=int(size)-1;i>=0;--i) out.push_back(uint8_t(value>>(i*8)));
+    };
+    put(r.sequence,8); put(r.frame,8);
+    for (auto mode:r.modes) { if(mode>5)throw std::invalid_argument("Invalid solver mode"); put(mode,1); }
+    for (unsigned channel=0;channel<2;++channel) {
+        const auto& samples=r.samples[channel]; const auto& state=r.states[channel];
+        if(samples.empty() || samples.size()>kMaxMotionSamples ||
+           (!state.empty() && state.size()!=kMotionPlusStateBytes))
+            throw std::invalid_argument("Invalid solver report bounds");
+        put(samples.size(),1); put(state.empty()?0:1,1);
+        for(const auto& s:samples) {put(s.valid?1:0,1);for(auto word:s.words)put(word,4);}
+        out.insert(out.end(),state.begin(),state.end());
+    }
+    return out;
+}
+MotionPlusReport DecodeMotionPlusReport(const std::vector<uint8_t>& bytes) {
+    size_t cursor=0;
+    const auto get=[&](unsigned size) {
+        if(size>bytes.size()-cursor)throw std::invalid_argument("Truncated solver report");
+        uint64_t value=0; while(size--)value=(value<<8)|bytes[cursor++]; return value;
+    };
+    if(get(1)!='D' || get(1)!=1)throw std::invalid_argument("Invalid solver report version");
+    MotionPlusReport r; r.sequence=get(8);r.frame=get(8);
+    for(auto& mode:r.modes) {mode=get(1);if(mode>5)throw std::invalid_argument("Invalid solver report mode");}
+    for(unsigned channel=0;channel<2;++channel) {
+        const auto count=get(1),present=get(1);
+        if(!count || count>kMaxMotionSamples || present>1)throw std::invalid_argument("Invalid solver report bounds");
+        for(unsigned i=0;i<count;++i) {
+            SolverSample s;const auto valid=get(1);if(valid>1)throw std::invalid_argument("Invalid solver validity");
+            s.valid=valid;for(auto& word:s.words)word=get(4);r.samples[channel].push_back(s);
+        }
+        if(present)for(size_t i=0;i<kMotionPlusStateBytes;++i)r.states[channel].push_back(get(1));
+    }
+    if(cursor!=bytes.size())throw std::invalid_argument("Trailing solver report bytes");
+    return r;
+}
+}

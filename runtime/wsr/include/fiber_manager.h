@@ -19,6 +19,7 @@
 #endif
 
 #include "ppc_runtime.h"
+#include "host_context.h"
 
 // Forward declarations
 struct CpuContext;
@@ -52,7 +53,21 @@ struct GuestFiber {
 class GuestFiberManager {
 public:
     // Initialize the fiber system - must be called from main thread
-    static void Initialize();
+    static void Initialize(HostContext::Backend backend = HostContext::Backend::Default);
+
+    struct WorkerCheckpoint {
+        struct Worker {
+            uint32_t thread;
+            GuestFiber metadata;
+            HostContext::Snapshot continuation;
+        };
+        std::vector<Worker> workers;
+    };
+    // Partial scheduler domain: suspended workers only. The main/scheduler
+    // continuation, guest queues, timers and CPU TLS are separate state.
+    // Reject topology/lifetime changes instead of resuming freed stacks.
+    static WorkerCheckpoint CaptureSuspendedWorkers();
+    static void RestoreSuspendedWorkers(const WorkerCheckpoint& checkpoint);
     
     // Shutdown the fiber system
     static void Shutdown();

@@ -101,9 +101,11 @@ sent, using Python's [SSL API](https://docs.python.org/3/library/ssl.html).
 driven by host time outside network waits. CPU scheduling, other game state,
 resource completion, and rendering behavior can differ without the solver digest
 detecting it. Complete state checks, deterministic scheduling, recovery snapshots,
-and rollback remain future work. Input exchange currently waits for a round trip
-each interval, so higher latency can slow gameplay; adaptive input buffering is
-also outstanding. Reaching the lobby does not establish that a whole match stays
+and rollback remain future work. From preview 0.3.3, both peers send captures
+immediately and consume matching pairs through a fixed input delay chosen from
+pre-game round-trip probes. Frame/mode/solver checks follow the delayed captures.
+Late or lost packets still pause play. Mid-session delay changes and rollback
+remain outstanding. Reaching the lobby does not establish that a whole match stays
 in sync.
 
 The code was compiled and Python syntax checked. Gameplay and two-PC testing are

@@ -15,6 +15,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <stdexcept>
+#include <cstdlib>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -254,6 +256,13 @@ inline const std::optional<std::filesystem::path>& PortableRootDirectory() {
 }
 
 inline std::filesystem::path ApplicationDataDirectory() {
+    // Session brokers isolate mutable state while sharing the installed binary
+    // and its immutable assets. UTF-8 is needed for Windows user/profile paths.
+    if (const char* overridePath = std::getenv("RESORT_USERDATA_DIR"); overridePath && *overridePath) {
+        const auto path = PathFromUtf8(overridePath);
+        if (!path.is_absolute()) throw std::invalid_argument("RESORT_USERDATA_DIR must be absolute");
+        return path;
+    }
     if (const auto& portableRoot = PortableRootDirectory()) {
         return *portableRoot / kPortableUserDataDirectoryName;
     }

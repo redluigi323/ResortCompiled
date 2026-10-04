@@ -1,4 +1,6 @@
 #include "host_context.h"
+#include "host_context_rewind.h"
+#include <stdexcept>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -23,7 +25,7 @@ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argumen
 #error "HostContext needs a supported cooperative-context backend"
 #endif
 
-namespace HostContext {
+namespace HostContext::Legacy {
 
 #if defined(_WIN32)
 
@@ -267,4 +269,44 @@ void Switch(Handle target)
 
 #endif
 
-} // namespace HostContext
+} // namespace HostContext::Legacy
+
+namespace HostContext {
+namespace { thread_local bool rewindable = false, initialized = false; }
+bool InitializeScheduler(Handle* scheduler, Backend backend) {
+    if (initialized) return false;
+    const bool selected = backend == Backend::Rewindable;
+    const bool ok = selected ? Rewindable::InitializeScheduler(scheduler) : Legacy::InitializeScheduler(scheduler);
+    if (ok) { rewindable = selected; initialized = true; }
+    return ok;
+}
+void ShutdownScheduler(Handle scheduler) {
+    if (rewindable) Rewindable::ShutdownScheduler(scheduler); else Legacy::ShutdownScheduler(scheduler);
+    rewindable = false;
+    initialized = false;
+}
+Handle Create(size_t size, Entry entry, void* arg) {
+    return rewindable ? Rewindable::Create(size,entry,arg) : Legacy::Create(size,entry,arg);
+}
+void Destroy(Handle context) {
+    if (rewindable) Rewindable::Destroy(context); else Legacy::Destroy(context);
+}
+bool IsCurrent(Handle context) {
+    return rewindable ? Rewindable::IsCurrent(context) : Legacy::IsCurrent(context);
+}
+void Switch(Handle context) {
+    if (rewindable) Rewindable::Switch(context); else Legacy::Switch(context);
+}
+Snapshot Capture(Handle context) {
+    if (!rewindable) throw std::logic_error("Native continuation capture requires the rewindable backend");
+    return Rewindable::Capture(context);
+}
+void ValidateRestore(Handle context, const Snapshot& image) {
+    if (!rewindable) throw std::logic_error("Native continuation restore requires the rewindable backend");
+    Rewindable::ValidateRestore(context,image);
+}
+void Restore(Handle context, const Snapshot& image) {
+    ValidateRestore(context,image);
+    Rewindable::Restore(context,image);
+}
+}

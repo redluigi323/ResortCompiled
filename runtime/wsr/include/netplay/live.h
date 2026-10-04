@@ -7,6 +7,8 @@ namespace Riisorted::Netplay::Live {
 void InitializeFromEnvironment();
 bool Active() noexcept;
 uint8_t LocalChannel() noexcept;
+// Host publishes canonical virtual MotionPlus results; guest receives them.
+std::vector<uint8_t> ShareMotionPlusReport(const std::vector<uint8_t>& hostReport = {});
 AgreedInputs Exchange(const MotionBatch& local, const std::array<uint8_t, 2>& modes,
                      uint64_t previousSolverHash);
 }

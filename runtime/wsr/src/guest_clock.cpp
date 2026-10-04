@@ -2,6 +2,7 @@
 #include "timebase_contract.h"
 #include <chrono>
 #include <mutex>
+#include <algorithm>
 
 namespace GuestClock {
 namespace {
@@ -25,12 +26,16 @@ std::chrono::steady_clock::time_point ToHostTime(std::chrono::steady_clock::time
     return guest + paused + (depth ? std::chrono::steady_clock::now() - pauseStart :
                                     std::chrono::steady_clock::duration{});
 }
-Pause::Pause() noexcept {
+Pause::Pause(std::chrono::steady_clock::duration elapsedBudget) noexcept
+    : elapsedBudget_(std::max(elapsedBudget, std::chrono::steady_clock::duration::zero())) {
     std::lock_guard<std::mutex> lock(clockMutex);
     if (depth++ == 0) pauseStart = std::chrono::steady_clock::now();
 }
 Pause::~Pause() {
     std::lock_guard<std::mutex> lock(clockMutex);
-    if (--depth == 0) paused += std::chrono::steady_clock::now() - pauseStart;
+    if (--depth == 0) {
+        const auto elapsed = std::chrono::steady_clock::now() - pauseStart;
+        paused += elapsed - std::min(elapsed, elapsedBudget_);
+    }
 }
 }

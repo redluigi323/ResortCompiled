@@ -99,15 +99,25 @@ progress stays in separate session data and does not overwrite personal saves.
 
 ## What to report from the first remote match
 
-The same-PC test succeeded. Two-PC internet play has not yet been verified.
-The implementation waits for both inputs every interval, so higher latency can
-slow gameplay. Solver disagreement stops the session, but full game-state checks
+The same-PC test and an EOS connection between Linux and Windows succeeded.
+The initial internet test was latency bound at 9–10 FPS. Preview 0.3.3 sends
+inputs ahead of use, with a fixed delay chosen from connection latency; both
+players must update their launcher and installed runtime. Missing packets still
+pause play, so jitter or loss can cause stalls. The 0.3.3 internet run reached
+roughly 56 FPS and stopped during the transition into Swordplay. Preview 0.3.4
+corrects bridge clock overhead and reduces delay; actual game performance and
+the transition failure still need a two-PC run. Preview 0.3.5 additionally makes
+the host supply canonical MotionPlus results/calibration state to both games,
+after the 0.3.4 reports showed a solver-only mismatch with matching frames/modes. Solver disagreement stops the
+session, but full game-state checks
 and deterministic scheduling are still incomplete. ZeroTier connectivity does
 not itself prevent game desynchronization.
 
 Compare menu progress, sword movement, hit results, and round endings on both PCs.
 If it stops or the screens differ, keep **both players'** `online.log`, `native.log`,
-and `game/UserData/Logs` from their session folders. Launcher sessions are under
+and `game/UserData/Logs` from their session folders. From preview 0.3.4, also
+include `desync.json` when present; it identifies the failed frame/mode/solver
+check and contains the two failed captures, without an invitation or save file. Launcher sessions are under
 its per-user data directory in `Netplay/`; the dialog prints the folder location.
 Avoid sharing invitations, certificate private keys, or the NAND/save directories
 in public reports. Report the preview version, ping to the host's ZeroTier IP,
