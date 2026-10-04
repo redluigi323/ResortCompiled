@@ -6,14 +6,14 @@ from pathlib import Path
 import sys
 import time
 
-from PySide6.QtCore import (Qt, QRectF, QSize, QLockFile, QProcess, QProcessEnvironment,
+from PySide6.QtCore import (Qt, QRectF, QSize, QLockFile, QProcess, QProcessEnvironment, QTimer,
                             QStandardPaths, QUrl)
 from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 
-from backend import (Installer, MiiResourceInstaller, atomic_text, child_environment, configure_game,
+from backend import (Installer, MiiResourceInstaller, RuntimeInstaller, ensure_runtime, atomic_text, child_environment, configure_game,
                      game_executable, import_mii, installation, missing_mii, native_library_path, read_json)
 
 from mii_data import database_path, ensure_database
@@ -140,12 +140,13 @@ class Launcher(QMainWindow):
                 self.edition = "original"
             candidate = Path(state.get("installation", ""))
             if state.get("installation"):
-                installation(candidate)
+                installation(candidate, require_runtime=False)
                 self.path = candidate
         except (OSError, ValueError):
             pass
         self.build_ui()
         self.refresh()
+        QTimer.singleShot(0, self.prepare_runtime)
 
     def build_ui(self):
         root = QWidget(); root.setObjectName("surface")
@@ -313,8 +314,9 @@ class Launcher(QMainWindow):
         if not (path / "installation.json").exists():
             path = path / "Resort"
         try:
-            installation(path)
+            installation(path, require_runtime=False)
             self.path = path; self.save_state(); self.message.setText(""); self.refresh()
+            self.prepare_runtime()
         except (OSError, ValueError) as exc:
             self.error(str(exc))
 
@@ -322,6 +324,16 @@ class Launcher(QMainWindow):
         self.message.setText(""); self.details.clear(); self.details.hide()
         self.last_log = self.data / "Logs" / f"install-{time.time_ns()}.log"
         self.worker = Installer(Path(self.image_path.text()), Path(self.library_path.text()), self.last_log)
+        self.start_worker()
+
+    def prepare_runtime(self):
+        lock = self.data_lock()
+        if lock is None:
+            return
+        self.setup_lock = lock
+        self.last_log = self.data / 'Logs' / f'runtime-install-{time.time_ns()}.log'
+        self.details.clear()
+        self.worker = RuntimeInstaller(self.path, self.last_log)
         self.start_worker()
 
     def start_worker(self):
@@ -340,12 +352,15 @@ class Launcher(QMainWindow):
 
     def installed(self, value):
         self.path = Path(value); self.save_state()
-        self.message.setText("Mii artwork is ready. Create your own Miis or optionally import a collection."
+        self.message.setText("This release’s runtime is ready. Your saves and Miis are preserved."
+                             if isinstance(self.worker, RuntimeInstaller) else
+                             "Mii artwork is ready. Create your own Miis or optionally import a collection."
                              if isinstance(self.worker, MiiResourceInstaller) else
                              "Your game is installed. Create your own Miis or optionally import a collection.")
 
     def install_failed(self, text):
-        operation = "Mii artwork setup" if isinstance(self.worker, MiiResourceInstaller) else "Installation"
+        operation = ('Runtime setup' if isinstance(self.worker, RuntimeInstaller) else
+                     "Mii artwork setup" if isinstance(self.worker, MiiResourceInstaller) else "Installation")
         self.message.setText(f"{operation} didn’t finish: {text}\nUse Open logs for the full details.")
 
     def install_finished(self):
@@ -415,12 +430,13 @@ class Launcher(QMainWindow):
         self.start_worker()
 
     def play(self):
-        if self.game or not self.path:
+        if self.game or self.worker or not self.path:
             return
         lock = QLockFile(str(self.path / ".game.lock")); lock.setStaleLockTime(0)
         if not lock.tryLock(0):
             self.error("This installation is already running in another launcher."); return
         try:
+            ensure_runtime(self.path)
             configure_game(self.path, self.edition)
             process = QProcess(self)
             environment = QProcessEnvironment()
@@ -452,6 +468,7 @@ class Launcher(QMainWindow):
         if not lock.tryLock(0):
             self.error("Close the game or other launcher before starting online play."); return
         try:
+            ensure_runtime(self.path)
             configure_game(self.path, "riisorted")
             from netplay_ui import OnlineDialog
             dialog = OnlineDialog(self.path / "Runtime", self.data / "Netplay", self)
