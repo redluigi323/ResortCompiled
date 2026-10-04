@@ -86,19 +86,140 @@ def game_executable() -> str:
     return "Resortcompiled.exe" if sys.platform == "win32" else "Resortcompiled"
 
 
-def installation(path: Path) -> dict:
+def installation(path: Path, require_runtime=True) -> dict:
     meta = read_json(path / "installation.json")
     if meta.get("application") != APP_ID or meta.get("schema") != 1:
         raise ValueError("This is not a supported launcher installation.")
     if meta.get("game_id") != GAME_ID or meta.get("dol_sha256") != DOL_SHA256:
         raise ValueError("This installation uses a different game revision.")
-    for item in (path / "Game/sys/main.dol", path / "Game/sys/boot.bin",
-                 path / "Runtime" / game_executable(), path / "Runtime/portable.txt"):
+    required = [path / "Game/sys/main.dol", path / "Game/sys/boot.bin"]
+    if require_runtime:
+        required += [path / "Runtime" / game_executable(), path / "Runtime/portable.txt"]
+    for item in required:
         if not item.is_file():
             raise ValueError(f"Installation is incomplete: {item.name} is missing.")
     if not (path / "Game/files").is_dir():
         raise ValueError("The extracted game files are missing.")
     return meta
+
+
+def file_hash(path: Path) -> str:
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def bundled_runtime():
+    payload = payload_root()
+    release = read_json(payload / 'release.json')
+    if (release.get('game_id') != GAME_ID or release.get('dol_sha256') != DOL_SHA256
+            or release.get('platform') != sys.platform):
+        raise ValueError('The bundled runtime does not match this launcher/platform.')
+    source = payload / 'runtime'
+    files = release.get('runtime_files')
+    if files is None:  # Allow older release payloads to be adopted safely.
+        files = {p.relative_to(source).as_posix(): file_hash(p)
+                 for p in source.rglob('*') if p.is_file()}
+    if not isinstance(files, dict) or game_executable() not in files:
+        raise ValueError('The launcher runtime payload is incomplete. Extract the entire release archive.')
+    for name, digest in files.items():
+        relative = Path(name)
+        if (relative.is_absolute() or '..' in relative.parts or 'UserData' in relative.parts
+                or not isinstance(digest, str) or len(digest) != 64):
+            raise ValueError('Invalid bundled runtime manifest.')
+    return source, release, files
+
+
+def runtime_matches(runtime: Path, files: dict, checkpoint=lambda: None):
+    for name, digest in files.items():
+        checkpoint()
+        item = runtime / name
+        if not item.is_file() or item.is_symlink() or file_hash(item) != digest:
+            return False
+    return (runtime / 'portable.txt').is_file()
+
+
+def stamp_runtime(runtime: Path, release: dict, files: dict):
+    (runtime / 'portable.txt').touch()
+    atomic_text(runtime / 'runtime-release.json', json.dumps({
+        'version': release['version'], 'runtime_files': files,
+    }, indent=2))
+
+
+def ensure_runtime(root: Path, checkpoint=lambda: None, report=lambda text: None):
+    """Install this launcher's native payload, preserving UserData and rollback.
+
+    Caller holds the installation game lock. No compilation or downloads.
+    """
+    installation(root, require_runtime=False)
+    journal = root / '.runtime-update.json'
+    if journal.exists():
+        interrupted = read_json(journal)
+        names = (interrupted.get('stage', ''), interrupted.get('backup', ''))
+        if any(not isinstance(name, str) or Path(name).name != name for name in names):
+            raise ValueError('Invalid runtime recovery metadata.')
+        previous_stage, previous_backup = (root / name for name in names)
+        if not names[0].startswith('.runtime-install-') or not names[1].startswith('.runtime-backup-'):
+            raise ValueError('Invalid runtime recovery directories.')
+        if not (root / 'Runtime').exists() and previous_backup.exists():
+            if (previous_stage / 'UserData').exists() and not (previous_backup / 'UserData').exists():
+                (previous_stage / 'UserData').rename(previous_backup / 'UserData')
+            previous_backup.rename(root / 'Runtime')
+            report('Recovered the previous runtime after an interrupted update.')
+        elif not (root / 'Runtime').exists() and previous_stage.exists():
+            previous_stage.rename(root / 'Runtime')
+            report('Recovered the staged runtime after an interrupted installation.')
+        # Never discard a directory still holding user data during recovery.
+        if (previous_stage / 'UserData').exists():
+            raise ValueError(f'Runtime recovery needs attention; preserved data at {previous_stage}')
+        shutil.rmtree(previous_stage, ignore_errors=True)
+        journal.unlink()
+    source, release, files = bundled_runtime()
+    runtime = root / 'Runtime'
+    if runtime_matches(runtime, files, checkpoint):
+        stamp_runtime(runtime, release, files)
+        report(f"Runtime ready · {release['version']}")
+        return False
+    stage = root / ('.runtime-install-' + uuid.uuid4().hex)
+    backup = root / ('.runtime-backup-' + uuid.uuid4().hex)
+    saved_old = moved_data = committed = False
+    try:
+        report(f"Installing bundled runtime · {release['version']}…")
+        stage.mkdir()
+        for name, digest in files.items():
+            checkpoint()
+            item = source / name
+            if item.is_symlink() or not item.is_file() or file_hash(item) != digest:
+                raise ValueError(f'Bundled runtime file is missing or damaged: {name}')
+            target = stage / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+        stamp_runtime(stage, release, files)
+        checkpoint()
+        atomic_text(journal, json.dumps({'stage': stage.name, 'backup': backup.name}))
+        # The directory swap is on the installation's filesystem. Once it
+        # starts, finish or roll back before acknowledging cancellation.
+        if runtime.exists():
+            runtime.rename(backup)
+            saved_old = True
+        if (backup / 'UserData').exists():
+            (backup / 'UserData').rename(stage / 'UserData')
+            moved_data = True
+        else:
+            (stage / 'UserData').mkdir()
+        stage.rename(runtime)
+        committed = True
+        report(f"Runtime installed · {release['version']}; saves and Miis preserved.")
+        if saved_old:
+            report(f'Previous runtime retained at {backup}')
+        return True
+    finally:
+        if not committed:
+            if moved_data:
+                (stage / 'UserData').rename(backup / 'UserData')
+            if saved_old:
+                backup.rename(runtime)
+            shutil.rmtree(stage, ignore_errors=True)
+        journal.unlink(missing_ok=True)
 
 
 def missing_mii(path: Path) -> list[str]:
@@ -285,7 +406,8 @@ class Installer(QThread):
             self.checkpoint()
             self.phase.emit("Getting ready to play", "Installing the native runtime and edition folders…")
             self.copy_runtime(runtime, stage / "Runtime")
-            (stage / "Runtime/portable.txt").touch()
+            _, bundled_release, runtime_files = bundled_runtime()
+            stamp_runtime(stage / 'Runtime', bundled_release, runtime_files)
             (stage / "Runtime/UserData").mkdir(exist_ok=True)
             (stage / "Editions/Riisorted/files").mkdir(parents=True)
             atomic_text(stage / "installation.json", json.dumps({
@@ -327,6 +449,27 @@ class Installer(QThread):
         finally:
             if stage is not None:
                 shutil.rmtree(stage, ignore_errors=True)
+
+
+class RuntimeInstaller(Installer):
+    """Repair/update native files without extracting the disc or replacing saves."""
+    def __init__(self, root: Path, log: Path):
+        super().__init__(Path(), root, log)
+
+    def run(self):
+        try:
+            self.phase.emit('Preparing your runtime', 'Installing this release’s native game files…')
+            def report(text):
+                self.output.emit(text)
+                self.log.parent.mkdir(parents=True, exist_ok=True)
+                with self.log.open('a', encoding='utf-8') as stream:
+                    stream.write(text + '\n')
+            ensure_runtime(self.library, self.checkpoint, report)
+            self.installed.emit(str(self.library))
+        except Cancelled:
+            self.cancelled.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class MiiResourceInstaller(Installer):
