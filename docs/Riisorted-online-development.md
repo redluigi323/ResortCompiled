@@ -87,6 +87,9 @@ Network waits are excluded from guest time-base reads, VI timing, sleep deadline
 and audio elapsed-time sampling. Missing input waits instead of prediction;
 connection timeouts stop the session. Packet sizes and input sequence/channel
 metadata are bounded and checked.
+The host's initial lobby wait has no deadline and ends only on cancellation or
+connection. CLI `--address` binds the host listener to that IPv4 address; the GUI
+provides a network device/address picker with ZeroTier preferred.
 
 Build/content fingerprints are checked before save exchange. During play, frame
 indices, requested MotionPlus modes, and the previous interval's solver digest
