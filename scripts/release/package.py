@@ -89,6 +89,8 @@ def main():
             "schema": 1, "version": args.version, "platform": sys.platform,
             "architecture": platform.machine(), "game_id": GAME_ID,
             "dol_sha256": DOL_SHA256, "required_free_bytes": 6 * 1024**3,
+            "runtime_files": {p.relative_to(target).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                              for p in sorted(target.rglob('*')) if p.is_file()},
         }, indent=2), encoding="utf-8")
         licenses = staged / "licenses"; licenses.mkdir()
         for source, name in ((ROOT / "external/wiicompiled/LICENSE", "WiiCompiled-LICENSE"),
