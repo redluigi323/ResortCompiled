@@ -60,8 +60,10 @@ license files into the release.
   file-backed output, preserving UI responsiveness.
 - Installs stage in a uniquely named sibling directory. Game ID and DOL SHA-256
   must match before the complete installation is renamed into `Resort/`.
-- An existing `Resort/` is never overwritten. Locate it to use it, or choose
-  another parent directory. This first version does not implement updates.
+- Existing game files are kept when locating a `Resort/` installation. Preview
+  0.2.2 verifies and installs the launcher's bundled runtime automatically. New
+  native files are staged, UserData is preserved, and the previous runtime is
+  retained in a `.runtime-backup-*` folder. Interrupted swaps use recovery metadata.
 - Saves stay under `Resort/Runtime/UserData`. A portable marker and relative
   config paths allow moving the complete installation.
 - New installations generate `RFL_DB.dat` locally. No existing personal Miis or
@@ -113,9 +115,9 @@ Original sets `paths.overlay_roots = []`. Riisorted sets it to the installation'
 **Online play · Experimental**, with Host/Join, invitations, guest Mii selection,
 and optional keeping of guest Miis after the session. Online progress stays in
 an isolated session folder. See [online instructions](../docs/Riisorted-online-development.md).
-Existing installations need the newly built `out/Resortcompiled` copied into their
-`Runtime/Resortcompiled`, or a newly packaged runtime; both peers must use the same
-build. Automatic updates and downloaded packs remain future work.
+Existing installations receive the packaged runtime when opened or located by
+the new launcher. Both peers must use the same build. Downloading new releases
+and downloaded packs remain future work; runtime repair uses the current bundle.
 
 ## Source and credits
 
