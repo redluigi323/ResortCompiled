@@ -4,6 +4,7 @@ import uuid
 import tomllib
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout)
@@ -46,6 +47,17 @@ class OnlineDialog(QDialog):
         form = QFormLayout()
         self.role = QComboBox(); self.role.addItems(['Host a session', 'Join a session'])
         form.addRow('Session', self.role)
+        self.network = QComboBox()
+        self.refresh_network = QPushButton('Refresh')
+        self.refresh_network.clicked.connect(self.load_networks)
+        network_row = QHBoxLayout(); network_row.addWidget(self.network, 1)
+        network_row.addWidget(self.refresh_network)
+        self.network_label = QLabel('Host network')
+        form.addRow(self.network_label, network_row)
+        self.network_note = QLabel('Choose the ZeroTier device for internet play. Share its IP with your guest. '
+                                  'The lobby stays open until you leave.')
+        self.network_note.setWordWrap(True); form.addRow(self.network_note)
+        self.load_networks()
         self.address = QLineEdit(); self.address.setPlaceholderText('Host IP address (when joining)')
         form.addRow('Host address', self.address)
         self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(42680)
@@ -82,10 +94,34 @@ class OnlineDialog(QDialog):
         self.address.setEnabled(joining); self.port.setEnabled(not joining)
         self.code.setReadOnly(not joining)
         self.miis.setVisible(joining); self.mii_label.setVisible(joining)
+        for widget in (self.network, self.refresh_network, self.network_label, self.network_note):
+            widget.setVisible(not joining)
+
+    def load_networks(self):
+        previous = self.network.currentData()
+        self.network.clear()
+        entries = []
+        for interface in QNetworkInterface.allInterfaces():
+            if not interface.flags() & QNetworkInterface.InterfaceFlag.IsUp:
+                continue
+            for entry in interface.addressEntries():
+                ip = entry.ip()
+                if ip.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                    continue
+                name = interface.name()
+                zerotier = name.startswith('zt') or 'zerotier' in interface.humanReadableName().lower()
+                label = f'{"ZeroTier · " if zerotier else ""}{name} — {ip.toString()}'
+                entries.append((not zerotier, ip.isLoopback(), label, ip.toString()))
+        for _, _, label, ip in sorted(entries):
+            self.network.addItem(label, ip)
+        self.network.addItem('All networks — 0.0.0.0 (share your reachable IP)', '0.0.0.0')
+        index = self.network.findData(previous)
+        if index >= 0: self.network.setCurrentIndex(index)
 
     def begin(self):
         role = 'host' if self.role.currentIndex() == 0 else 'join'
-        address = self.address.text().strip() if role == 'join' else '0.0.0.0'
+        address = self.address.text().strip() if role == 'join' else self.network.currentData()
+        self.host_address = address
         code = self.code.toPlainText().strip()
         if role == 'join' and (not address or not code):
             QMessageBox.information(self, 'Join session', 'Enter the host address and invitation.'); return
@@ -100,15 +136,19 @@ class OnlineDialog(QDialog):
         self.worker.invitation.connect(self.show_invitation)
         self.worker.failure.connect(self.output.appendPlainText)
         self.worker.finished.connect(self.done_running)
-        for widget in (self.start, self.role, self.address, self.port, self.code, self.miis): widget.setEnabled(False)
+        for widget in (self.start, self.role, self.address, self.port, self.code, self.miis,
+                       self.network, self.refresh_network): widget.setEnabled(False)
         self.keep.setEnabled(False); self.stop.setText('Leave session'); self.worker.start()
 
     def show_invitation(self, code):
         self.code.setPlainText(code); self.copy.setEnabled(True)
-        self.output.appendPlainText('Share the invitation and your IP address with the other player.')
+        ip = self.host_address
+        self.output.appendPlainText(f'Share this invitation and host IP {ip} with the other player.'
+            if ip != '0.0.0.0' else 'Share this invitation and your ZeroTier or LAN IP (not 0.0.0.0).')
 
     def done_running(self):
-        for widget in (self.start, self.role, self.code, self.miis): widget.setEnabled(True)
+        for widget in (self.start, self.role, self.code, self.miis, self.network,
+                       self.refresh_network): widget.setEnabled(True)
         self.role_changed(); self.stop.setText('Close')
         run = getattr(self.engine, 'run', None)
         self.keep.setEnabled(self.engine.role == 'host' and run is not None and (run / 'UserData/NAND' / DB).exists())
